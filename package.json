@@ -1,6 +1,6 @@
 {
   "name": "pi-reddit-research",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Reddit JSON research tools and skill for pi coding agent.",
   "type": "module",
   "keywords": [
