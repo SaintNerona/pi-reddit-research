@@ -45,7 +45,7 @@ Listing tools return a `next page: pass after=...` line when Reddit supplied a c
 - Reuse it with the same query/scope/sort/time (and the same `username` for `reddit_user`); changing any of those invalidates the cursor.
 - One page is usually enough. Fetch a second page only when the first page is thin, the user asks for more, or a claim needs more evidence.
 - Reddit does not error on a bad cursor: it returns HTTP 200 with the same page and the same cursor again. So do not retry the same cursor expecting progress, and do not invent cursor values.
-- `reddit_search` and `reddit_trends` only accept a single cursor for a single-subreddit scope (search also supports all-Reddit scope). With several subreddits the cursor is ignored and the output says so; per-subreddit cursors are in tool details.
+- `reddit_search` and `reddit_trends` only accept a single cursor for a single-subreddit scope (search also supports all-Reddit scope). With several subreddits the cursor is ignored and the output says so. Follow the per-subreddit instructions in the text or `cursors.per_subreddit`: a safe `after` advances only past a contiguous prefix of returned posts; `restart: true` means re-run that subreddit without `after` to recover unreturned posts. Narrow to one subreddit and deduplicate by post ID, because local ranking may repeat posts.
 - `reddit_user` uses `after_posts` (from `more posts: pass after_posts=t3_...`) and `after_comments` (from `more comments: pass after_comments=t1_...`). Mixing them up is rejected with a note instead of silently repeating page one.
 
 ## Source Credibility
