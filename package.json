@@ -1,6 +1,6 @@
 {
   "name": "pi-reddit-research",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Reddit JSON research tools and skill for pi coding agent.",
   "type": "module",
   "keywords": [
@@ -27,7 +27,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22.5.0"
+    "node": ">=22.19.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -40,5 +40,18 @@
     "skills": [
       "./skills"
     ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.0.2",
+    "@types/node": "22.19.19",
+    "typebox": "1.3.27",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "test": "node --test --experimental-test-isolation=none tests/reddit-research.test.mjs",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "smoke:live": "node scripts/smoke-live.mjs",
+    "prepublishOnly": "npm run check"
   }
 }
