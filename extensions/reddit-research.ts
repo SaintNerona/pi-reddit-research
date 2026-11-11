@@ -72,6 +72,7 @@ type RedditTime = "hour" | "day" | "week" | "month" | "year" | "all";
 type RedditDepth = "quick" | "normal" | "deep";
 type TrendListing = "hot" | "top" | "new" | "rising" | "controversial";
 type TrendOrder = "reddit" | "ranked";
+type PostFormat = "full" | "compact";
 type RedditIntent =
 	| "opinions"
 	| "bugs"
@@ -89,6 +90,7 @@ const times = new Set<RedditTime>(["hour", "day", "week", "month", "year", "all"
 const depths = new Set<RedditDepth>(["quick", "normal", "deep"]);
 const trendListings = new Set<TrendListing>(["hot", "top", "new", "rising", "controversial"]);
 const trendOrders = new Set<TrendOrder>(["reddit", "ranked"]);
+const postFormats = new Set<PostFormat>(["full", "compact"]);
 
 function defaultTrendOrder(listing: TrendListing): TrendOrder {
 	return listing === "rising" || listing === "controversial" ? "reddit" : "ranked";
@@ -149,6 +151,10 @@ interface RedditPost {
 	flair: string;
 	selftext: string;
 	over18: boolean;
+	externalUrl?: string;
+	isSelf: boolean;
+	stickied: boolean;
+	isVideo: boolean;
 	rankScore?: number;
 	rankReasons?: string[];
 }
@@ -851,6 +857,20 @@ function parsePost(child: JsonObject): RedditPost | undefined {
 	if (!id) return undefined;
 	const permalink = String(data.permalink ?? `/comments/${id}/`);
 	const createdUtc = Number(data.created_utc ?? 0);
+	const isSelf = data.is_self === true;
+	let externalUrl: string | undefined;
+	if (!isSelf && typeof data.url === "string") {
+		try {
+			const destination = new URL(data.url);
+			const host = destination.hostname.toLowerCase().replace(/\.$/, "");
+			if (["https:", "http:"].includes(destination.protocol) && !destination.username && !destination.password
+				&& host !== "reddit.com" && !host.endsWith(".reddit.com")) {
+				externalUrl = destination.href;
+			}
+		} catch {
+			// Missing/invalid destinations do not invalidate the Reddit source post.
+		}
+	}
 	return {
 		id,
 		fullname: String(data.name ?? `t3_${id}`),
@@ -867,6 +887,10 @@ function parsePost(child: JsonObject): RedditPost | undefined {
 		flair: String(data.link_flair_text ?? ""),
 		selftext: String(data.selftext ?? ""),
 		over18: Boolean(data.over_18),
+		externalUrl,
+		isSelf,
+		stickied: data.stickied === true,
+		isVideo: data.is_video === true,
 	};
 }
 
@@ -1259,10 +1283,12 @@ function topComments(comments: RedditComment[], limit: number, minLength = 20) {
 
 function formatPostLine(post: RedditPost, index: number) {
 	const flair = post.flair ? ` [${post.flair}]` : "";
+	const sticky = post.stickied ? " [sticky]" : "";
 	const nsfw = post.over18 ? " NSFW" : "";
 	const rank = post.rankScore !== undefined ? `, rank ${post.rankScore}` : "";
 	const reasons = post.rankReasons?.length ? ` (${post.rankReasons.join("; ")})` : "";
-	return `${index}. r/${post.subreddit}${flair}${nsfw} - ${post.title}\n   score ${post.score}, comments ${post.numComments}, age ${post.age}, by u/${post.author}${rank}${reasons}\n   ${post.url}`;
+	const destination = post.externalUrl ? `\n   destination: ${post.externalUrl}` : "";
+	return `${index}. r/${post.subreddit}${flair}${sticky}${nsfw} - ${post.title}\n   score ${post.score}, comments ${post.numComments}, age ${post.age}, by u/${post.author}${rank}${reasons}\n   ${post.url}${destination}`;
 }
 
 function formatPostExcerpt(post: RedditPost) {
@@ -1288,6 +1314,31 @@ function formatPosts(posts: RedditPost[], title: string) {
 		lines.push(formatPostExcerpt(post));
 	});
 	return lines.join("\n");
+}
+
+function formatPostListing(posts: RedditPost[], title: string, format: PostFormat, navigation: string) {
+	if (!posts.length) return { text: formatPosts(posts, title), shown: 0 };
+	const header = compactWhitespace(title, 240);
+	const blocks = posts.map((post, index) => {
+		if (format === "full") return `${formatPostLine(post, index + 1)}\n${formatPostExcerpt(post)}`;
+		const sticky = post.stickied ? " [sticky]" : "";
+		const nsfw = post.over18 ? " NSFW" : "";
+		const destination = post.externalUrl ? ` | destination ${post.externalUrl}` : "";
+		return `${index + 1}. r/${compactWhitespace(post.subreddit, 32)}${sticky}${nsfw} | score ${post.score}, comments ${post.numComments}, age ${post.age} | ${compactWhitespace(post.title, 140)} | ${post.url.replace(/[\r\n\t]/g, "")}${destination}`;
+	});
+	// Reuse limitOutput's exact footer reservation, but never slice a post entry.
+	const budget = maxOutputChars - limitOutput("", navigation).length;
+	const full = [header, ...blocks].join("\n");
+	if (full.length <= budget) return { text: full, shown: posts.length };
+	const notice = (shown: number) => `\n\n[truncated: showing ${shown} of ${posts.length}; use format=compact or lower limit before paginating. Full results remain in details.posts.]`;
+	let body = header;
+	let shown = 0;
+	for (const block of blocks) {
+		if (body.length + 1 + block.length + notice(shown + 1).length > budget) break;
+		body += `\n${block}`;
+		shown++;
+	}
+	return { text: body + notice(shown), shown };
 }
 
 function observedSubreddits(posts: RedditPost[]) {
@@ -1905,14 +1956,15 @@ export default function redditResearch(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "reddit_search",
 		label: "Reddit Search",
-		description: "Search Reddit posts and return a compact list without fetching comment threads.",
+		description: "Search up to 100 Reddit posts without fetching comment threads. Use format=compact for one-line entries; full is the default. Structured results retain all selected posts when text is shortened.",
 		promptSnippet: "Search Reddit posts by query, subreddit scope, sort, and time window",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query." }),
 			subreddits: Type.Optional(Type.String({ description: "Optional comma-separated subreddit names, for example: LocalLLaMA, LocalLLM, ClaudeCode. Do not pass a JSON list." })),
 			sort: Type.Optional(Type.String({ enum: [...sorts], description: "Sort: relevance, hot, top, new, comments. Default relevance." })),
 			time: Type.Optional(Type.String({ enum: [...times], description: "Time range. Default year." })),
-			limit: Type.Optional(Type.Number({ description: "Maximum posts. Default 8, max 25." })),
+			limit: Type.Optional(Type.Number({ description: "Maximum posts. Default 8, max 100." })),
+			format: Type.Optional(Type.String({ enum: [...postFormats], description: "Output format: full (default) or compact (one line per post). Does not change fetching or structured results." })),
 			after: Type.Optional(Type.String({ description: "Pagination cursor from a previous reddit_search result." })),
 		}),
 		prepareArguments(args) {
@@ -1922,7 +1974,8 @@ export default function redditResearch(pi: ExtensionAPI) {
 				subreddits: stringListParam(raw.subreddits),
 				sort: enumValue(raw.sort, sorts, "relevance"),
 				time: enumValue(raw.time, times, "year"),
-				limit: clampInt(raw.limit, 8, 1, 25),
+				limit: clampInt(raw.limit, 8, 1, 100),
+				format: enumValue(raw.format, postFormats, "full"),
 				after: optionalString(raw.after),
 			};
 		},
@@ -1933,13 +1986,15 @@ export default function redditResearch(pi: ExtensionAPI) {
 				subreddits: stringList(params.subreddits),
 				sort: enumValue(params.sort, sorts, "relevance"),
 				time: enumValue(params.time, times, "year"),
-				limit: clampInt(params.limit, 8, 1, 25),
+				limit: clampInt(params.limit, 8, 1, 100),
 				after: optionalString(params.after),
 				signal,
 			});
 			const scope = stringList(params.subreddits)?.map((s) => `r/${s}`).join(", ") ?? "all Reddit";
-			return textResult(formatPosts(posts, `Reddit posts for "${params.query}" in ${scope}`),
-				{ posts, cursors }, listingNavigation(cursors, "query/sort/time"));
+			const format = enumValue(params.format, postFormats, "full");
+			const navigation = listingNavigation(cursors, "query/sort/time/limit");
+			const output = formatPostListing(posts, `Reddit posts for "${params.query}" in ${scope}`, format, navigation);
+			return textResult(output.text, { posts, cursors, format, posts_shown: output.shown }, navigation);
 		},
 	});
 
@@ -2105,7 +2160,8 @@ export default function redditResearch(pi: ExtensionAPI) {
 			listing: Type.Optional(Type.String({ enum: [...trendListings], description: "Listing type: hot, top, new, rising, controversial. Default hot." })),
 			order: Type.Optional(Type.String({ enum: [...trendOrders], description: "reddit preserves native order (round-robin across subreddits); ranked uses local relevance/engagement ranking. Default reddit for rising/controversial, ranked for hot/top/new." })),
 			time: Type.Optional(Type.String({ enum: [...times], description: "Time window for top and controversial only. Default week." })),
-			limit: Type.Optional(Type.Number({ description: "Maximum total posts. Default 10, max 30." })),
+			limit: Type.Optional(Type.Number({ description: "Maximum total posts. Default 10, max 100." })),
+			format: Type.Optional(Type.String({ enum: [...postFormats], description: "Output format: full (default) or compact (one line per post). Does not change fetching, ordering or structured results." })),
 			after: Type.Optional(Type.String({ description: "Pagination cursor from a previous reddit_trends result. Needs a single-subreddit scope." })),
 		}),
 		prepareArguments(args) {
@@ -2116,7 +2172,8 @@ export default function redditResearch(pi: ExtensionAPI) {
 				listing,
 				order: enumValue(raw.order, trendOrders, defaultTrendOrder(listing)),
 				time: enumValue(raw.time, times, "week"),
-				limit: clampInt(raw.limit, 10, 1, 30),
+				limit: clampInt(raw.limit, 10, 1, 100),
+				format: enumValue(raw.format, postFormats, "full"),
 				after: optionalString(raw.after),
 			};
 		},
@@ -2126,7 +2183,7 @@ export default function redditResearch(pi: ExtensionAPI) {
 			if (!subreddits.length) return textResult("Provide at least one subreddit.");
 			const listing = enumValue(params.listing, trendListings, "hot");
 			const order = enumValue(params.order, trendOrders, defaultTrendOrder(listing));
-			const limit = clampInt(params.limit, 10, 1, 30);
+			const limit = clampInt(params.limit, 10, 1, 100);
 			const after = optionalString(params.after);
 			const multiScope = subreddits.length > 1;
 			// Cursors are per listing: Reddit ignores a cursor sent to a multi-subreddit scope by
@@ -2157,11 +2214,18 @@ export default function redditResearch(pi: ExtensionAPI) {
 					for (const page of pages) if (page[i]) ordered.push(page[i]);
 				}
 			}
-			const posts = ordered.slice(0, limit);
+			const seen = new Set<string>();
+			const posts = ordered.filter((post) => {
+				if (seen.has(post.id)) return false;
+				seen.add(post.id);
+				return true;
+			}).slice(0, limit);
 			store.savePosts(posts);
 			const cursors = returnedListingCursors(listings, posts, Boolean(multiScope && after));
-			return textResult(formatPosts(posts, `Reddit ${listing} trends in ${subreddits.map((s) => `r/${s}`).join(", ")}`),
-				{ posts, cursors, order }, listingNavigation(cursors, "listing/time/order"));
+			const format = enumValue(params.format, postFormats, "full");
+			const navigation = listingNavigation(cursors, "listing/time/order/limit");
+			const output = formatPostListing(posts, `Reddit ${listing} trends in ${subreddits.map((s) => `r/${s}`).join(", ")}`, format, navigation);
+			return textResult(output.text, { posts, cursors, order, format, posts_shown: output.shown }, navigation);
 		},
 	});
 }
