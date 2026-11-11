@@ -14,6 +14,7 @@ process.env.PI_REDDIT_SQLITE_PATH = join(cache, 'reddit.sqlite');
 process.env.PI_REDDIT_CONFIG_PATH = join(cache, 'no-config.json');
 process.env.PI_REDDIT_COOKIE = 'synthetic-test-cookie';
 process.env.PI_REDDIT_DELAY_MS = '250';
+process.env.PI_REDDIT_SUBREDDIT_TTL_MS = '604800000';
 process.env.PI_REDDIT_MAX_OUTPUT_CHARS = '2000';
 process.env.PI_REDDIT_STATUS_FOOTER = 'false';
 const originalFetch = globalThis.fetch;
@@ -55,8 +56,8 @@ const call = async (name, args) => {
 };
 const text = (result) => result.content[0].text;
 
-test('Pi loader registers eight tools and all prepared arguments validate', async () => {
-  assert.equal(extension.tools.size, 8);
+test('Pi loader registers nine tools and all prepared arguments validate', async () => {
+  assert.equal(extension.tools.size, 9);
   const { validateToolArguments } = await import('@earendil-works/pi-ai');
   const examples = {
     reddit_url_extract: { url_or_id: 't3_abc123' }, reddit_resolve_subreddits: { topic: 'test' },
@@ -64,6 +65,7 @@ test('Pi loader registers eight tools and all prepared arguments validate', asyn
     reddit_search: { query: 'test', subreddits: ['Alpha'] }, reddit_thread: { url_or_id: 'abc123' },
     reddit_user: { username: 'u/testuser', sections: 'comments' },
     reddit_subreddits: { query: 'test' }, reddit_trends: { subreddits: 'Alpha,Beta' },
+    reddit_subreddit_info: { names: ['r/Alpha', 'Beta'], include_rules: 'false' },
   };
   for (const [name, args] of Object.entries(examples)) {
     const tool = extension.tools.get(name).definition;
@@ -604,6 +606,187 @@ test('trends preparation normalizes listing/order and defaults invalid values sa
   assert.equal(tool.prepareArguments({ listing: 'controversial', order: 'invalid' }).order, 'reddit');
   assert.equal(tool.prepareArguments({ listing: 'hot', order: 'invalid' }).order, 'ranked');
   assert.equal(tool.prepareArguments({ listing: 'best' }).listing, 'hot');
+});
+
+const subredditAbout = (name, overrides = {}) => ({ kind: 't5', data: {
+  display_name: name, title: `Community ${name}`, public_description: 'Community summary', description: 'Community description',
+  subscribers: 12345, created_utc: 1500000000, over18: false, subreddit_type: 'public', quarantine: false, lang: 'en', submission_type: 'any',
+  ...overrides,
+} });
+const subredditRules = (count = 2) => ({ rules: Array.from({ length: count }, (_, i) => ({ short_name: `Rule ${i + 1}`, description: `Description of rule ${i + 1}` })) });
+
+test('subreddit info exposes bounded metadata/rules and caches both for seven days', async () => {
+  respond = (url) => ok(url.pathname.endsWith('/rules')
+    ? { rules: Array.from({ length: 15 }, () => ({ short_name: 'R'.repeat(200), description: 'D'.repeat(1000) })) }
+    : subredditAbout('InfoFull', { title: 'T'.repeat(1000), public_description: 'P'.repeat(1000), description: 'D'.repeat(3000), accounts_active: 20, active_user_count: 42 }));
+  const before = requests.length;
+  const result = await call('reddit_subreddit_info', { names: 'r/InfoFull' });
+  assert.deepEqual(requests.slice(before).map((url) => url.pathname), ['/r/InfoFull/about', '/r/InfoFull/about/rules']);
+  assert.equal(result.details.include_rules, true);
+  assert.deepEqual(result.details.errors, []);
+  const item = result.details.subreddits[0];
+  assert.equal(item.about.display_name, 'InfoFull');
+  assert.equal(item.about.subscribers, 12345);
+  assert.equal(item.about.created_utc, 1500000000);
+  assert.ok(item.about.age);
+  assert.equal(item.about.over18, false);
+  assert.equal(item.about.quarantine, false);
+  assert.equal(item.about.subreddit_type, 'public');
+  assert.equal(item.about.lang, 'en');
+  assert.equal(item.about.submission_type, 'any');
+  assert.ok(item.about.title.length <= 162);
+  assert.ok(item.about.public_description.length <= 362);
+  assert.ok(item.about.description.length <= 602);
+  assert.equal(item.about.accounts_active, undefined);
+  assert.equal(item.about.active_user_count, undefined);
+  assert.equal(item.rules.length, 10);
+  assert.equal(item.rules_total, 15);
+  assert.ok(item.rules.every((rule) => rule.short_name.length <= 102 && rule.description.length <= 302));
+  assert.match(text(result), /request fewer names or pass include_rules=false/);
+  await call('reddit_subreddit_info', { names: 'InfoFull' });
+  assert.equal(requests.length - before, 2, 'second call reuses both raw cached endpoints');
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(join(cache, 'reddit.sqlite'));
+  try {
+    const rows = db.prepare("SELECT expires_at - saved_at AS ttl FROM requests WHERE url LIKE '%/r/InfoFull/%'").all();
+    assert.equal(rows.length, 2);
+    assert.ok(rows.every((row) => row.ttl === 604800000));
+  } finally { db.close(); }
+});
+
+test('metadata-only calls skip rules, preserve zero/false, and can reuse about cache when rules are later requested', async () => {
+  respond = (url) => ok(url.pathname.endsWith('/rules') ? subredditRules(0) : subredditAbout('InfoCache', { subscribers: 0, created_utc: undefined }));
+  const before = requests.length;
+  const first = await call('reddit_subreddit_info', { names: ['r/InfoCache', 'INFOCACHE'], include_rules: 'false' });
+  assert.equal(first.details.subreddits.length, 1);
+  assert.equal(first.details.include_rules, false);
+  assert.equal(first.details.subreddits[0].rules, undefined);
+  assert.equal(first.details.subreddits[0].about.subscribers, 0);
+  assert.equal(first.details.subreddits[0].about.over18, false);
+  assert.equal(first.details.subreddits[0].about.age, undefined);
+  assert.match(text(first), /subscribers 0; age unknown/);
+  assert.match(text(first), /NSFW no/);
+  assert.equal(requests.length - before, 1);
+  const second = await call('reddit_subreddit_info', { names: 'InfoCache' });
+  assert.equal(requests.length - before, 2, 'only the new rules URL is fetched');
+  assert.deepEqual(second.details.subreddits[0].rules, []);
+  assert.equal(second.details.subreddits[0].rules_total, 0);
+});
+
+test('optional malformed fields stay unknown, alternate NSFW key is accepted, and online counts are omitted', async () => {
+  respond = () => ok(subredditAbout('InfoUnknown', {
+    title: {}, public_description: [], description: 123, subscribers: 'not a count', created_utc: -1,
+    over18: null, over_18: true, quarantine: 'false', lang: {}, submission_type: [], subreddit_type: null, accounts_active: 7,
+  }));
+  const result = await call('reddit_subreddit_info', { names: 'InfoUnknown', include_rules: false });
+  const about = result.details.subreddits[0].about;
+  for (const key of ['title', 'public_description', 'description', 'subscribers', 'created_utc', 'age', 'quarantine', 'lang', 'submission_type', 'subreddit_type', 'accounts_active']) assert.equal(about[key], undefined, key);
+  assert.equal(about.over18, true);
+  assert.match(text(result), /subscribers unknown; age unknown/);
+  assert.match(text(result), /NSFW yes; quarantined unknown/);
+});
+
+test('404/restricted communities and rules failures retain successful siblings and do not start a resource-denial cooldown', async () => {
+  respond = (url) => {
+    const name = url.pathname.split('/')[2];
+    if (url.pathname === '/search') return ok(listing([post('infoend')]));
+    if (name === 'MissingInfo') return new Response('', { status: 404 });
+    if (name === 'PrivateInfo') return Response.json({ reason: 'gold_only' }, { status: 403 });
+    if (name === 'InfoPartial' && url.pathname.endsWith('/rules')) return new Response('Synthetic unavailable rules', { status: 503 });
+    return ok(url.pathname.endsWith('/rules') ? subredditRules() : subredditAbout(name));
+  };
+  const before = requests.length;
+  const result = await call('reddit_subreddit_info', { names: 'MissingInfo, PrivateInfo, InfoPartial, InfoGood' });
+  const [missing, restricted, partial, good] = result.details.subreddits;
+  assert.deepEqual(missing.errors, ['about: not found']);
+  assert.deepEqual(restricted.errors, ['about: restricted: gold_only']);
+  assert.equal(missing.about, undefined);
+  assert.equal(restricted.about, undefined);
+  assert.equal(partial.about.display_name, 'InfoPartial');
+  assert.equal(partial.rules, undefined);
+  assert.match(partial.errors[0], /^rules: Reddit JSON HTTP 503/);
+  assert.equal(good.rules.length, 2);
+  assert.deepEqual(good.errors, []);
+  assert.equal(requests.length - before, 6, 'failed about lookups do not trigger rules requests');
+  assert.match(text(result), /fetch errors:/);
+  assert.match(text(result), /restricted: gold_only/);
+  await call('reddit_search', { query: 'uncached-info-followup' });
+  assert.equal(requests.length - before, 7, 'next uncached URL reaches HTTP rather than a global cooldown');
+});
+
+for (const [name, payload] of [['BadNull', null], ['BadData', { data: [] }], ['BadListing', listing([])], ['BadMismatch', subredditAbout('DifferentCommunity')]]) {
+  test(`malformed about response ${name} is reported per community, not returned as healthy metadata`, async () => {
+    respond = () => ok(payload);
+    const before = requests.length;
+    const result = await call('reddit_subreddit_info', { names: name });
+    assert.equal(result.details.subreddits[0].about, undefined);
+    assert.match(result.details.errors[0], /REDDIT_API_INVALID_RESPONSE/);
+    assert.equal(requests.length - before, 1, 'rules are not fetched for malformed about data');
+    respond = () => ok(subredditAbout(name));
+    const recovered = await call('reddit_subreddit_info', { names: name, include_rules: false });
+    assert.equal(recovered.details.subreddits[0].about.display_name, name);
+    assert.equal(requests.length - before, 2, 'invalid metadata must not become a fresh cache hit');
+  });
+}
+
+test('malformed rules preserve metadata; invalid rule entries/fields are filtered safely', async () => {
+  respond = (url) => {
+    const name = url.pathname.split('/')[2];
+    if (!url.pathname.endsWith('/rules')) return ok(subredditAbout(name));
+    return ok(name === 'BadRules' ? { rules: {} } : { rules: [null, 'bad', [], { description: 'no name' }, { short_name: 'One', description: {} }, { short_name: 'Two', description: 'valid' }] });
+  };
+  const result = await call('reddit_subreddit_info', { names: 'BadRules,FilterRules' });
+  assert.ok(result.details.subreddits[0].about);
+  assert.equal(result.details.subreddits[0].rules, undefined);
+  assert.match(result.details.subreddits[0].errors[0], /REDDIT_API_INVALID_RESPONSE/);
+  assert.deepEqual(result.details.subreddits[1].rules, [{ short_name: 'One', description: undefined }, { short_name: 'Two', description: 'valid' }]);
+  assert.equal(result.details.subreddits[1].rules_total, 6);
+});
+
+test('subreddit name validation rejects unsafe/over-limit inputs before any HTTP and bounds echoed input', async () => {
+  const before = requests.length;
+  for (const names of ['', 'A,B,C,D,E,F', 'a/b', 'https://www.reddit.com/r/python/', '../private', 'alpha?x=1', 'x'.repeat(10000)]) {
+    const result = await invoke(extension, 'reddit_subreddit_info', { names });
+    assert.equal(result.isError, true, names.slice(0, 30));
+    assert.ok(text(result).length < 240);
+  }
+  assert.equal(requests.length, before);
+});
+
+test('five distinct communities plus case-insensitive duplicates use at most ten endpoints', async () => {
+  respond = (url) => ok(url.pathname.endsWith('/rules') ? subredditRules() : subredditAbout(url.pathname.split('/')[2]));
+  const before = requests.length;
+  const result = await call('reddit_subreddit_info', { names: 'FiveA,FiveB,FiveC,FiveD,FiveE,r/fivea' });
+  assert.equal(result.details.subreddits.length, 5);
+  assert.equal(requests.length - before, 10);
+});
+
+test('all community errors remain in details and a bounded error summary survives truncated metadata output', async () => {
+  respond = (url) => ok(url.pathname.endsWith('/rules')
+    ? { wrong_shape: true }
+    : subredditAbout(url.pathname.split('/')[2], { title: 'long '.repeat(300), description: 'description '.repeat(300) }));
+  const result = await call('reddit_subreddit_info', { names: 'TruncA,TruncB,TruncC,TruncD,TruncE' });
+  assert.equal(result.details.errors.length, 5);
+  assert.match(text(result), /truncated/);
+  for (const name of ['TruncA', 'TruncB', 'TruncC', 'TruncD', 'TruncE']) assert.match(text(result), new RegExp(`r/${name} rules:`));
+  assert.match(text(result), /Full errors are in details.subreddits/);
+  assert.doesNotMatch(text(result), /Additional pagination instructions/);
+});
+
+test('subreddit info cancellation stops before rules and remaining community lookups', async () => {
+  const controller = new AbortController();
+  respond = (url) => {
+    controller.abort(new Error('Synthetic info cancellation.'));
+    return ok(subredditAbout(url.pathname.split('/')[2]));
+  };
+  const tool = extension.tools.get('reddit_subreddit_info').definition;
+  const before = requests.length;
+  await assert.rejects(tool.execute('cancel-info', tool.prepareArguments({ names: 'CancelInfo,LaterInfo' }), controller.signal, undefined, {}), /Synthetic info cancellation/);
+  assert.equal(requests.length - before, 1);
+  const aborted = new AbortController();
+  aborted.abort(new Error('Already cancelled.'));
+  await assert.rejects(tool.execute('cancel-info-early', tool.prepareArguments({ names: 'NeverInfo' }), aborted.signal, undefined, {}), /Already cancelled/);
+  assert.equal(requests.length - before, 1);
 });
 
 const more = (children, parent = 't3_abc123', depth = 0, count = children.length) => ({ kind: 'more', data: {
