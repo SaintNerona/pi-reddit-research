@@ -71,7 +71,7 @@ reddit_trends(subreddits: "popular", listing: "new", order: "reddit")
 
 ### Named subreddit metadata and rules
 
-**Unreleased:** this tool is not included in the published 0.2.0 package. See [CHANGELOG.md](CHANGELOG.md).
+Available since 0.3.0. See [CHANGELOG.md](CHANGELOG.md).
 
 ```
 reddit_subreddit_info(names: "LocalLLaMA, python")
@@ -89,7 +89,7 @@ reddit_subreddit_info(names: "r/programming", include_rules: false)
 
 ### Thread completeness and comment expansion
 
-These comment-expansion changes are unreleased; the package version remains 0.2.0.
+Available since 0.3.0.
 
 ```
 reddit_thread(url_or_id: "POST_ID", comment_limit: 500)
@@ -109,7 +109,7 @@ reddit_thread(url_or_id: "AMA_POST_ID", sort: "qa", expand_more: 2)
 - Comment sorts are `top` (default), `new`, `controversial`, `confidence`, `old` and `qa`. `old` asks Reddit for the oldest comments first; `qa` requests Reddit's Q&A ordering for AMA-style discussions. They apply to the initial fetch and both expansion endpoints. Compact output still selects highest-score `top_comments` from the fetched set; it does not preserve Reddit's fetched order.
 - `reddit_pack` does not opt into expansion; its request/depth behavior stays unchanged. Comment-permalink subtree routing is not added. No new dependencies, SQLite columns or authentication settings are required.
 
-### Larger listings and post context (unreleased)
+### Larger listings and post context
 
 ```text
 reddit_search(query: "python packaging", subreddits: "Python", limit: 100, format: "compact")
@@ -123,7 +123,7 @@ reddit_trends(subreddits: "all", listing: "hot", order: "reddit", limit: 100, fo
 - Posts preserve `url` as the Reddit permalink. `externalUrl`, when available, is an absolute HTTP(S) destination outside `reddit.com` and its subdomains, for non-self posts only. Invalid destinations and URLs containing user credentials are omitted; Reddit CDN links such as `i.redd.it` may still be destinations.
 - Structured post data also includes `isSelf`, `stickied` and `isVideo`. Output marks sticky posts with `[sticky]` and shows external destinations without replacing source links. Shared thread, account and research-pack output receives this context too; their request/depth limits are unchanged. No new SQLite columns or authentication settings are required.
 
-These listing options are not included in the published 0.2.0 package.
+Available since 0.3.0.
 
 ### Pagination
 
@@ -274,6 +274,8 @@ The live smoke also exercises budgeted comment expansion, a 500-comment fetch, 1
 `npm run smoke:live` uses real Reddit HTTP with your existing cookie configuration, a fresh temporary SQLite cache, and the same Pi loader/agent loop. Only the model stream is synthetic; no LLM provider is called. Requests are paced at least two seconds apart (a larger `PI_REDDIT_DELAY_MS` is respected). It checks all nine tools, global/scoped search, API/public-link hosts, `raw_json=1` title preservation, and nonoverlapping second-page IDs for search, trends, user posts, and user comments when Reddit supplies cursors. Missing cursors are explicitly reported as unavailable checks. Deterministic offline fixtures also cover literal HTML/entity text.
 
 The temporary cache is removed when finished; credentials are never printed. The smoke runner observes actual HTTP statuses and blocks further network requests after the first 429, even if stale-cache fallback conceals it from a tool. HTTP errors, partial tool failures, or failed assertions exit nonzero and mean live validation is blocked/failed, not accepted. It prints whether the shipped User-Agent or an environment override is in use; for final-default acceptance, unset `PI_REDDIT_USER_AGENT` before running.
+
+Known live limitations in 0.3.0: Reddit returned a redirect for `r/all/hot` and HTTP 403 for a real `morechildren` expansion request during verification. Redirects are not followed, and failed expansions preserve initial thread evidence with an explicit error. Metadata/rules, compact listings, thread reads and `old`/`qa` sorts passed focused live checks, but the full live smoke did not pass. Endpoint availability remains subject to Reddit access restrictions.
 
 Before publishing, run `npm run check`, `npm run smoke:live`, and `npm pack --dry-run`. Existing releases use a package version commit and an annotated `v<version>` tag. Tag and publish the approved integration commit, then verify the npm version, dist tag, `gitHead`, and tarball contents.
 

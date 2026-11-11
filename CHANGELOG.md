@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-11-11
 
 ### Added
 
@@ -23,4 +23,5 @@
 ### Notes
 
 - `reddit_pack` does not opt into expansion; comment-permalink subtree routing is not added.
-- No new dependencies, database migrations, authentication settings or write operations. The package version remains 0.2.0; these changes have not been released.
+- No new dependencies, database migrations, authentication settings or write operations.
+- Live verification remains limited by Reddit access restrictions: `r/all/hot` returned a redirect that was safely rejected, and a real `morechildren` request returned HTTP 403. Initial thread evidence is preserved when expansion fails. Offline integration coverage does not guarantee live endpoint availability.
