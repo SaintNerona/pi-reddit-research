@@ -107,7 +107,7 @@ try {
     const metadataOnly = await call('reddit_subreddit_info', { names: 'programming', include_rules: false });
     assert.ok(metadataOnly.details.subreddits[0].about);
     assert.equal(metadataOnly.details.subreddits[0].rules, undefined);
-    assert.deepEqual(metadataPaths.splice(0), ['/r/programming/about.json']);
+    assert.deepEqual(metadataPaths.splice(0), ['/r/programming/about']);
     const missingName = `pi_missing_${Date.now().toString(36)}`;
     const mixed = await invoke(extension, 'reddit_subreddit_info', { names: `${missingName},lounge,learnpython` });
     assert.equal(mixed.isError, false);
@@ -115,10 +115,10 @@ try {
     assert.equal(missing.about, undefined);
     // Reddit may redirect a nonexistent community to an HTTP-200 listing, not a 404.
     assert.equal(missing.errors.length, 1);
-    assert.match(missing.errors[0], /^about: (?:not found|restricted: .+|Malformed subreddit about response or mismatched community name\.)$/);
+    assert.match(missing.errors[0], /^about: (?:not found|restricted: .+|REDDIT_API_INVALID_RESPONSE: .+|REDDIT_API_REDIRECT: .+)$/);
     assert.ok(valid.about, 'valid community after missing/restricted lookups was blocked');
     assert.deepEqual(valid.errors, []);
-    assert.ok(metadataPaths.includes('/r/learnpython/about.json'), 'successful sibling must reach an uncached endpoint');
+    assert.ok(metadataPaths.includes('/r/learnpython/about'), 'successful sibling must reach an uncached endpoint');
     if (lounge.errors.some((error) => error.includes('restricted:'))) console.log('Restricted-community denial reported without blocking uncached sibling metadata.');
     else if (lounge.about && !lounge.errors.length) console.log('r/lounge is readable for this account; restricted-denial behavior is covered offline.');
     else throw new Error(`Unexpected lounge lookup failure: ${lounge.errors.join('; ')}`);
