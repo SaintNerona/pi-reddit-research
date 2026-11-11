@@ -101,7 +101,7 @@ Rules the code enforces, because Reddit does not error on a bad cursor (it answe
 
 ### Account checks
 
-`reddit_user` fetches `/user/<name>/about.json`, `/submitted.json`, and `/comments.json`:
+`reddit_user` fetches `/user/<name>/about`, `/user/<name>/submitted`, and `/user/<name>/comments` on `api.reddit.com`:
 
 ```
 reddit_user(username: "u/foo", sections: "about,posts", limit: 10)
@@ -111,13 +111,13 @@ reddit_user(username: "foo", sections: "comments", limit: 25, after_comments: "t
 
 Sections are comma-separated (`about`, `posts`, `comments`), default `about,posts`. The `limit` applies to posts and comments alike. Account age and karma are weak signals, not proof of expertise.
 
-Individual section failures do not abort the call: a suspended, deleted, private, or misspelled account produces whatever sections did resolve plus a `fetch errors` line. A string that cannot be a Reddit username at all (over 20 characters, shorter than a real username, or containing characters other than letters, digits, `_`, `-`) is rejected with a specific `Reddit usernames are at most 20 characters` / `too short` / `not a valid Reddit username` error instead of a pointless request. Because Reddit answers `/user/<name>/about.json` with HTTP 200 for banned and suspended accounts (no `is_suspended` flag), the tool reports `no public profile page for this account` when Reddit returns no profile object.
+Individual section failures do not abort the call: a suspended, deleted, private, or misspelled account produces whatever sections did resolve plus a `fetch errors` line. A string that cannot be a Reddit username at all (over 20 characters, shorter than a real username, or containing characters other than letters, digits, `_`, `-`) is rejected with a specific `Reddit usernames are at most 20 characters` / `too short` / `not a valid Reddit username` error instead of a pointless request. A valid user response with `subreddit: null` is reported as `no public profile page for this account`; this alone does not prove suspension. An invalid profile response appears in `fetch errors` rather than being treated as an empty profile.
 
 ## Configuration
 
 ### 1. JSON config (recommended)
 
-Since mid-2026, Reddit requires authentication for `.json` access. Create `~/.pi/agent/reddit-research.json`:
+API requests use `https://api.reddit.com` without a `.json` pathname suffix and include `raw_json=1`. Public post, comment, and canonical links remain on `https://www.reddit.com`. Configure your Reddit session cookie for authenticated access in `~/.pi/agent/reddit-research.json`:
 
 ```json
 {
@@ -166,7 +166,22 @@ Or reference a separate cookie file:
 
 ## Notes
 
-This extension uses Reddit's `.json` endpoints with local SQLite caching. **Since mid-2026, Reddit requires authentication for `.json` access.** Set your cookie in `~/.pi/agent/reddit-research.json`, via `cookieFile`, or via env vars to restore functionality.
+This extension uses Reddit's API JSON responses with local SQLite caching. Set your cookie in `~/.pi/agent/reddit-research.json`, via `cookieFile`, or via env vars. Cookies can expire, and Reddit can restrict access even with a configured cookie.
+
+### Endpoint failures and cache behaviour
+
+Normal requests detect unavailable or incompatible API endpoints; there are no background health probes:
+
+- `REDDIT_API_UNAVAILABLE`: connection, DNS, or TLS failure. Check your network and API host availability.
+- `REDDIT_API_ENDPOINT_GONE`: HTTP 410 for the requested route. API routing may need updating.
+- `REDDIT_API_REDIRECT`: HTTP 3xx. Redirects are not followed, so cookies cannot be forwarded to another host; verify routing first.
+- `REDDIT_API_INVALID_RESPONSE`: invalid JSON or an unexpected Listing, thread, or profile shape. The API may have changed.
+
+These symptoms do **not** prove that Reddit deprecated the API. HTTP 401/403 still indicate an authentication/access failure, HTTP 404 can indicate a missing user/thread/route, HTTP 429 starts a `Retry-After` cooldown (300 seconds when absent/invalid), and HTTP 5xx indicates a server error. Diagnostics exclude response bodies, query strings, cookies, and redirect targets.
+
+Invalid responses are not cached or indexed. Malformed cached payloads are ignored; empty valid Listings are still valid results. Fresh valid cache entries delay network failure detection until another network request is needed. Endpoint errors bypass stale cache, while existing authentication/rate/server-error paths may still return valid stale evidence. Failed cache rows need no manual deletion. An active in-memory cooldown must expire, or you can restart the Pi session; updating a cookie does not itself clear that cooldown.
+
+`reddit_user` and `reddit_pack` retain partial results and expose failures in `details.errors` and a reserved `fetch errors` line. Do not treat partial evidence as a clean success.
 
 Treat Reddit posts and comments as anecdotal evidence, not verified facts.
 
@@ -204,12 +219,16 @@ Requires Node.js 22.19 or newer, matching current Pi requirements. The extension
 ```bash
 npm ci
 npm run check
-npm run smoke:live
+PI_REDDIT_DELAY_MS=2000 npm run smoke:live
 ```
 
 `npm run check` performs strict TypeScript checking and offline regression tests. Tests load the extension with Pi's actual loader, invoke its tools through Pi's agent loop (including argument preparation and validation), and exercise the default TUI renderer. Reddit HTTP responses and the model stream are synthetic in these tests.
 
-`npm run smoke:live` uses real Reddit HTTP with your existing cookie configuration, a fresh temporary SQLite cache, and the same Pi loader/agent loop. Only the model stream is synthetic; no LLM provider is called. It checks all eight tools, smoke-checks rising/controversial and the all/popular feeds, exercises budgeted comment expansion and a 500-comment fetch, and verifies that page two does not overlap page one for search, trends, user posts, and user comments when Reddit supplies cursors. The temporary cache is removed when finished; credentials are never printed. It exits nonzero on HTTP errors, partial user-section errors, stopped comment expansions, or failed assertions.
+The live smoke also exercises budgeted comment expansion and a 500-comment fetch; stopped expansions fail validation.
+
+`npm run smoke:live` uses real Reddit HTTP with your existing cookie configuration, a fresh temporary SQLite cache, and the same Pi loader/agent loop. Only the model stream is synthetic; no LLM provider is called. Requests are paced at least two seconds apart (a larger `PI_REDDIT_DELAY_MS` is respected). It checks all eight tools, global/scoped search, API/public-link hosts, `raw_json=1` title preservation, and nonoverlapping second-page IDs for search, trends, user posts, and user comments when Reddit supplies cursors. Missing cursors are explicitly reported as unavailable checks. Deterministic offline fixtures also cover literal HTML/entity text.
+
+The temporary cache is removed when finished; credentials are never printed. The smoke runner observes actual HTTP statuses and blocks further network requests after the first 429, even if stale-cache fallback conceals it from a tool. HTTP errors, partial tool failures, or failed assertions exit nonzero and mean live validation is blocked/failed, not accepted. It prints whether the shipped User-Agent or an environment override is in use; for final-default acceptance, unset `PI_REDDIT_USER_AGENT` before running.
 
 Before publishing, run `npm run check`, `npm run smoke:live`, and `npm pack --dry-run`. Existing releases use a package version commit and an annotated `v<version>` tag. Tag and publish the approved integration commit, then verify the npm version, dist tag, `gitHead`, and tarball contents.
 
