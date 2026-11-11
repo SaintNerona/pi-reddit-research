@@ -325,8 +325,16 @@ test('trends preparation normalizes listing/order and defaults invalid values sa
 const more = (children, parent = 't3_abc123', depth = 0, count = children.length) => ({ kind: 'more', data: {
   id: children.length ? children[0] : '_', parent_id: parent, depth, count, children,
 } });
-const threadPayload = (id, children, long = false) => [listing([post(id, 'Alpha', 1, long)]), listing(children)];
-const morePayload = (things) => ({ json: { errors: [], data: { things } } });
+let expansionPostId;
+const expansionParents = (things) => things.map((thing) => {
+  if (thing?.data?.parent_id === 't3_abc123') thing.data.parent_id = `t3_${expansionPostId}`;
+  return thing;
+});
+const threadPayload = (id, children, long = false) => {
+  expansionPostId = id;
+  return [listing([post(id, 'Alpha', 1, long)]), listing(expansionParents(children))];
+};
+const morePayload = (things) => ({ json: { errors: [], data: { things: expansionParents(things) } } });
 const expansionRequests = (before) => requests.slice(before).filter((url) => url.pathname === '/api/morechildren.json');
 
 test('reddit_thread fetch cap is 500, default remains 50, and expansion is opt-in', async () => {
@@ -524,6 +532,36 @@ test('malformed child batches cannot overwrite indexed ownership before rejectio
     assert.equal(db.prepare('SELECT id FROM posts WHERE id = ?').get('wrongidx'), undefined);
   } finally { db.close(); }
 });
+
+for (const mismatch of ['post', 'parent', 'branch', 'nested']) {
+  test(`expansion rejects ${mismatch} ownership mismatches before changing evidence`, async () => {
+    const source = `own${mismatch}`;
+    const foreign = comment('foreignown');
+    Object.assign(foreign.data, { parent_id: 't3_otherown', link_id: 't3_otherown' });
+    respond = () => ok(threadPayload('otherown', [foreign]));
+    await call('reddit_thread', { url_or_id: 'otherown' });
+    respond = (url) => {
+      if (url.pathname !== '/api/morechildren.json') return ok(threadPayload(source, [comment('ownedroot'), more(['wantedown'])]));
+      const good = comment('wantedown'); good.data.parent_id = `t3_${source}`;
+      const bad = structuredClone(foreign);
+      if (mismatch === 'post') bad.data.parent_id = `t3_${source}`;
+      if (mismatch === 'parent') delete bad.data.link_id;
+      if (mismatch === 'branch') { delete bad.data.link_id; bad.data.parent_id = 't1_unrelated'; }
+      if (mismatch === 'nested') { good.data.replies = listing([bad]); return ok(morePayload([good])); }
+      return ok(morePayload([good, bad]));
+    };
+    const result = await call('reddit_thread', { url_or_id: source, expand_more: 1 });
+    assert.match(result.details.expansion_stopped, /another post|unrelated branch/);
+    assert.equal(result.details.expansion.comments_added, 0);
+    assert.deepEqual(result.details.comments.map((c) => c.id), ['ownedroot']);
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(join(cache, 'reddit.sqlite'));
+    try {
+      assert.equal(db.prepare('SELECT post_id FROM comments WHERE id = ?').get('foreignown').post_id, 'otherown');
+      assert.equal(db.prepare('SELECT id FROM comments WHERE id = ?').get('wantedown'), undefined);
+    } finally { db.close(); }
+  });
+}
 
 test('cancelling expansion keeps the fetched thread and does not fetch another batch', async () => {
   const controller = new AbortController();

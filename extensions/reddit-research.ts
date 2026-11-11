@@ -1077,6 +1077,40 @@ async function getThread(urlOrId: string, sort: RedditSort, commentLimit: number
 	return parseThread(await fetchRedditJson(path, threadTtlMs, signal));
 }
 
+function validateExpansionOwnership(things: JsonObject[], thread: ReturnType<typeof parseThread>, batch: string[]) {
+	const postId = `t3_${thread.post!.id}`;
+	const parents = new Set([postId, ...batch.map((id) => `t1_${id}`),
+		...thread.comments.map((comment) => `t1_${comment.id}`), ...thread.more.map((node) => node.parentId)]);
+	const nodes: { id?: string; parentId: string }[] = [];
+	const visit = (children: JsonObject[]) => {
+		for (const child of children) {
+			if (!child || !["t1", "more"].includes(String(child.kind)) || !child.data || typeof child.data !== "object" || Array.isArray(child.data)) {
+				throw new Error("Malformed Reddit comment expansion response.");
+			}
+			const data = child.data as JsonObject;
+			const parentId = optionalString(data.parent_id) ?? "";
+			if ((data.link_id !== undefined && data.link_id !== postId) || (parentId.startsWith("t3_") && parentId !== postId)) {
+				throw new Error("Reddit comment expansion belongs to another post.");
+			}
+			if (data.link_id === postId && parentId) parents.add(parentId);
+			nodes.push({ id: child.kind === "t1" ? `t1_${optionalString(data.id)?.replace(/^t1_/, "")}` : undefined, parentId });
+			if (data.replies && typeof data.replies === "object") visit(listingChildren(data.replies));
+		}
+	};
+	visit(things);
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const node of nodes) {
+			if (node.id && parents.has(node.parentId) && !parents.has(node.id)) {
+				parents.add(node.id);
+				changed = true;
+			}
+		}
+	}
+	if (nodes.some((node) => !parents.has(node.parentId))) throw new Error("Reddit comment expansion contains an unrelated branch.");
+}
+
 async function expandMore(thread: ReturnType<typeof parseThread>, sort: RedditSort, budget: number, signal?: AbortSignal) {
 	const loaded = new Set(thread.comments.map((comment) => comment.id));
 	const attempted = new Set<string>();
@@ -1115,6 +1149,7 @@ async function expandMore(thread: ReturnType<typeof parseThread>, sort: RedditSo
 				|| (thing.kind === "more" && !Array.isArray((thing.data as JsonObject).children)))) {
 				throw new Error("Malformed Reddit comment expansion response.");
 			}
+			validateExpansionOwnership(things, thread, batch);
 			const parsed = parseCommentTree(things);
 			const added: RedditComment[] = [];
 			for (const comment of parsed.comments) {
