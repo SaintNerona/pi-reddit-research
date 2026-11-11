@@ -72,6 +72,7 @@ type RedditTime = "hour" | "day" | "week" | "month" | "year" | "all";
 type RedditDepth = "quick" | "normal" | "deep";
 type TrendListing = "hot" | "top" | "new" | "rising" | "controversial";
 type TrendOrder = "reddit" | "ranked";
+type PostFormat = "full" | "compact";
 type RedditIntent =
 	| "opinions"
 	| "bugs"
@@ -89,6 +90,7 @@ const times = new Set<RedditTime>(["hour", "day", "week", "month", "year", "all"
 const depths = new Set<RedditDepth>(["quick", "normal", "deep"]);
 const trendListings = new Set<TrendListing>(["hot", "top", "new", "rising", "controversial"]);
 const trendOrders = new Set<TrendOrder>(["reddit", "ranked"]);
+const postFormats = new Set<PostFormat>(["full", "compact"]);
 
 function defaultTrendOrder(listing: TrendListing): TrendOrder {
 	return listing === "rising" || listing === "controversial" ? "reddit" : "ranked";
@@ -149,6 +151,10 @@ interface RedditPost {
 	flair: string;
 	selftext: string;
 	over18: boolean;
+	externalUrl?: string;
+	isSelf: boolean;
+	stickied: boolean;
+	isVideo: boolean;
 	rankScore?: number;
 	rankReasons?: string[];
 }
@@ -163,6 +169,14 @@ interface RedditComment {
 	url?: string;
 	parentId?: string;
 	subreddit?: string;
+}
+
+interface MoreNode {
+	parentId: string;
+	depth: number;
+	count: number;
+	children: string[];
+	stub: boolean;
 }
 
 interface EvidenceItem {
@@ -618,6 +632,7 @@ function expectedPayload(url: string) {
 	if (/^\/user\/[^/]+\/about$/.test(path)) return "user profile (t2 with data.name)";
 	if (/^\/r\/[^/]+\/about$/.test(path)) return "subreddit metadata (t5 with data.display_name)";
 	if (/^\/r\/[^/]+\/about\/rules$/.test(path)) return "subreddit rules (rules array)";
+	if (path === "/api/morechildren") return "comment expansion (json.errors and data.things)";
 	return "Listing";
 }
 
@@ -638,6 +653,10 @@ function validRedditPayload(url: string, data: unknown) {
 			data.data.display_name.toLowerCase() === decodeURIComponent(new URL(url).pathname.split("/")[2]).toLowerCase();
 	}
 	if (expected.startsWith("subreddit rules")) return isJsonObject(data) && Array.isArray(data.rules);
+	if (expected.startsWith("comment expansion")) {
+		return isJsonObject(data) && isJsonObject(data.json) && Array.isArray(data.json.errors) &&
+			(data.json.errors.length > 0 || (isJsonObject(data.json.data) && Array.isArray(data.json.data.things)));
+	}
 	return isListing(data);
 }
 
@@ -655,18 +674,18 @@ class RedditRequestQueue {
 		return validRedditPayload(url, data) ? data : undefined;
 	}
 
-	async fetchJson(path: string, ttlMs = defaultTtlMs, signal?: AbortSignal) {
+	async fetchJson(path: string, ttlMs = defaultTtlMs, signal?: AbortSignal, onFetch?: () => void, indexPayload = true) {
 		signal?.throwIfAborted();
 		const url = normalizeRequestUrl(path);
 		const fresh = this.cached(url);
 		if (fresh !== undefined) return fresh;
 
-		const task = this.tail.then(() => this.fetchNow(url, ttlMs, signal));
+		const task = this.tail.then(() => this.fetchNow(url, ttlMs, signal, onFetch, indexPayload));
 		this.tail = task.catch(() => undefined);
 		return task;
 	}
 
-	private async fetchNow(url: string, ttlMs: number, signal?: AbortSignal) {
+	private async fetchNow(url: string, ttlMs: number, signal?: AbortSignal, onFetch?: () => void, indexPayload = true) {
 		signal?.throwIfAborted();
 		const fresh = this.cached(url);
 		if (fresh !== undefined) return fresh;
@@ -692,6 +711,8 @@ class RedditRequestQueue {
 		if (redditCookie) {
 			headers["cookie"] = redditCookie;
 		}
+		signal?.throwIfAborted();
+		onFetch?.();
 		let response: Response;
 		try {
 			response = await fetch(url, { signal, headers, redirect: "manual" });
@@ -764,15 +785,15 @@ class RedditRequestQueue {
 			throw endpointError("REDDIT_API_INVALID_RESPONSE", url, "The API response contract was not met; the endpoint may have changed.", response.status);
 		}
 		store.saveRequest(url, response.status, ttlMs, data);
-		indexRedditPayload(data);
+		if (indexPayload) indexRedditPayload(data);
 		return data;
 	}
 }
 
 const requestQueue = new RedditRequestQueue();
 
-async function fetchRedditJson(path: string, ttlMs = defaultTtlMs, signal?: AbortSignal) {
-	return requestQueue.fetchJson(path, ttlMs, signal);
+async function fetchRedditJson(path: string, ttlMs = defaultTtlMs, signal?: AbortSignal, onFetch?: () => void, indexPayload = true) {
+	return requestQueue.fetchJson(path, ttlMs, signal, onFetch, indexPayload);
 }
 
 function listingChildren(data: unknown) {
@@ -844,6 +865,20 @@ function parsePost(child: JsonObject): RedditPost | undefined {
 	if (!id) return undefined;
 	const permalink = String(data.permalink ?? `/comments/${id}/`);
 	const createdUtc = Number(data.created_utc ?? 0);
+	const isSelf = data.is_self === true;
+	let externalUrl: string | undefined;
+	if (!isSelf && typeof data.url === "string") {
+		try {
+			const destination = new URL(data.url);
+			const host = destination.hostname.toLowerCase().replace(/\.$/, "");
+			if (["https:", "http:"].includes(destination.protocol) && !destination.username && !destination.password
+				&& host !== "reddit.com" && !host.endsWith(".reddit.com")) {
+				externalUrl = destination.href;
+			}
+		} catch {
+			// Missing/invalid destinations do not invalidate the Reddit source post.
+		}
+	}
 	return {
 		id,
 		fullname: String(data.name ?? `t3_${id}`),
@@ -860,6 +895,10 @@ function parsePost(child: JsonObject): RedditPost | undefined {
 		flair: String(data.link_flair_text ?? ""),
 		selftext: String(data.selftext ?? ""),
 		over18: Boolean(data.over_18),
+		externalUrl,
+		isSelf,
+		stickied: data.stickied === true,
+		isVideo: data.is_video === true,
 	};
 }
 
@@ -867,32 +906,47 @@ function parsePosts(listing: unknown) {
 	return listingChildren(listing).map(parsePost).filter((post): post is RedditPost => !!post);
 }
 
-function flattenComments(children: JsonObject[], depth = 0, out: RedditComment[] = []) {
+function parseCommentTree(children: JsonObject[], depth = 0, out = { comments: [] as RedditComment[], more: [] as MoreNode[] }) {
 	for (const child of children) {
-		if (child.kind === "t1" && child.data && typeof child.data === "object") {
-			const data = child.data as JsonObject;
+		if (!child || !child.data || typeof child.data !== "object") continue;
+		const data = child.data as JsonObject;
+		const nodeDepth = typeof data.depth === "number" && Number.isInteger(data.depth) && data.depth >= 0 ? data.depth : depth;
+		if (child.kind === "more") {
+			const ids = Array.isArray(data.children)
+				? data.children.filter((id): id is string => typeof id === "string" && /^[a-z0-9]{1,12}$/i.test(id)) : [];
+			out.more.push({
+				parentId: optionalString(data.parent_id) ?? "",
+				depth: nodeDepth,
+				count: Number.isFinite(Number(data.count)) ? Math.max(0, Number(data.count)) : 0,
+				children: [...new Set(ids)],
+				stub: ids.length === 0,
+			});
+		} else if (child.kind === "t1") {
 			const body = String(data.body ?? "").trim();
 			if (body && body !== "[deleted]" && body !== "[removed]") {
-				out.push({
-					id: String(data.id ?? data.name ?? ""),
+				out.comments.push({
+					id: String(data.id ?? data.name ?? "").replace(/^t1_/, ""),
 					author: String(data.author ?? "unknown"),
 					score: Number(data.score ?? 0),
 					body,
-					depth,
+					depth: nodeDepth,
 					createdUtc: Number(data.created_utc ?? 0),
 					url: optionalString(data.permalink) ? redditUrl(String(data.permalink)) : undefined,
 					parentId: optionalString(data.parent_id),
 					subreddit: optionalString(data.subreddit),
 				});
 			}
-			const replies = data.replies;
-			if (replies && typeof replies === "object") {
-				const replyChildren = (((replies as JsonObject).data as JsonObject | undefined)?.children ?? []) as JsonObject[];
-				flattenComments(replyChildren, depth + 1, out);
+			if (data.replies && typeof data.replies === "object") {
+				const replies = ((data.replies as JsonObject).data as JsonObject | undefined)?.children;
+				if (Array.isArray(replies)) parseCommentTree(replies as JsonObject[], nodeDepth + 1, out);
 			}
 		}
 	}
 	return out;
+}
+
+function flattenComments(children: JsonObject[], depth = 0, out: RedditComment[] = []) {
+	return parseCommentTree(children, depth, { comments: out, more: [] }).comments;
 }
 
 function parseThread(data: unknown) {
@@ -902,7 +956,7 @@ function parseThread(data: unknown) {
 	const commentChildren = listingChildren(items[1]);
 	return {
 		post,
-		comments: flattenComments(commentChildren),
+		...parseCommentTree(commentChildren),
 	};
 }
 
@@ -1126,6 +1180,108 @@ async function getThread(urlOrId: string, sort: RedditSort, commentLimit: number
 	return parseThread(await fetchRedditJson(path, threadTtlMs, signal));
 }
 
+function validateExpansionOwnership(things: JsonObject[], thread: ReturnType<typeof parseThread>, batch: string[]) {
+	const postId = `t3_${thread.post!.id}`;
+	const parents = new Set([postId, ...batch.map((id) => `t1_${id}`),
+		...thread.comments.map((comment) => `t1_${comment.id}`), ...thread.more.map((node) => node.parentId)]);
+	const nodes: { id?: string; parentId: string }[] = [];
+	const visit = (children: JsonObject[]) => {
+		for (const child of children) {
+			if (!child || !["t1", "more"].includes(String(child.kind)) || !child.data || typeof child.data !== "object" || Array.isArray(child.data)) {
+				throw new Error("Malformed Reddit comment expansion response.");
+			}
+			const data = child.data as JsonObject;
+			if ((child.kind === "t1" && !optionalString(data.id)) || (child.kind === "more" && !Array.isArray(data.children))) {
+				throw new Error("Malformed Reddit comment expansion response.");
+			}
+			const parentId = optionalString(data.parent_id) ?? "";
+			if ((data.link_id !== undefined && data.link_id !== postId) || (parentId.startsWith("t3_") && parentId !== postId)) {
+				throw new Error("Reddit comment expansion belongs to another post.");
+			}
+			if (data.link_id === postId && parentId) parents.add(parentId);
+			nodes.push({ id: child.kind === "t1" ? `t1_${optionalString(data.id)?.replace(/^t1_/, "")}` : undefined, parentId });
+			if (data.replies && typeof data.replies === "object") visit(listingChildren(data.replies));
+		}
+	};
+	visit(things);
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const node of nodes) {
+			if (node.id && parents.has(node.parentId) && !parents.has(node.id)) {
+				parents.add(node.id);
+				changed = true;
+			}
+		}
+	}
+	if (nodes.some((node) => !parents.has(node.parentId))) throw new Error("Reddit comment expansion contains an unrelated branch.");
+}
+
+async function expandMore(thread: ReturnType<typeof parseThread>, sort: RedditSort, budget: number, signal?: AbortSignal) {
+	const loaded = new Set(thread.comments.map((comment) => comment.id));
+	const attempted = new Set<string>();
+	const nodes = new Map<string, MoreNode>();
+	let requests = 0;
+	let commentsAdded = 0;
+	let stopped: string | undefined;
+	const remember = (more: MoreNode[]) => {
+		for (const node of more) nodes.set(`${node.parentId}:${node.depth}:${node.children.join(",")}`, node);
+	};
+	remember(thread.more);
+	const pendingIds = () => [...new Set([...nodes.values()]
+		.sort((a, b) => a.depth - b.depth || b.count - a.count)
+		.flatMap((node) => node.children)
+		.filter((id) => !attempted.has(id) && !loaded.has(id)))];
+	const commentsSort = sort === "relevance" || sort === "comments" ? "confidence" : sort;
+	while (requests < budget && thread.post) {
+		const batch = pendingIds().slice(0, 100);
+		if (!batch.length) break;
+		try {
+			signal?.throwIfAborted();
+			for (const id of batch) attempted.add(id);
+			const path = `/api/morechildren.json?api_type=json&link_id=t3_${encodeURIComponent(thread.post.id)}&children=${encodeURIComponent(batch.join(","))}&sort=${encodeURIComponent(commentsSort)}`;
+			// Cached/stale responses do not spend the HTTP budget. Track the fetch boundary,
+			// not helper invocations; attempted ids still prevent cached empty-response loops.
+			// Validate the expansion envelope before updating any indexed evidence.
+			const payload = await fetchRedditJson(path, threadTtlMs, signal, () => { requests++; }, false);
+			const json = (payload as JsonObject | null)?.json as JsonObject | undefined;
+			const data = json?.data as JsonObject | undefined;
+			if (!json || !Array.isArray(json.errors)) throw new Error("Malformed Reddit comment expansion response.");
+			if (json.errors.length) throw new Error("Reddit returned comment expansion errors.");
+			if (!Array.isArray(data?.things)) throw new Error("Malformed Reddit comment expansion response.");
+			const things = data.things as JsonObject[];
+			if (things.some((thing) => !thing || !["t1", "more"].includes(String(thing.kind)) || !thing.data || typeof thing.data !== "object" || Array.isArray(thing.data)
+				|| (thing.kind === "t1" && !optionalString((thing.data as JsonObject).id))
+				|| (thing.kind === "more" && !Array.isArray((thing.data as JsonObject).children)))) {
+				throw new Error("Malformed Reddit comment expansion response.");
+			}
+			validateExpansionOwnership(things, thread, batch);
+			const parsed = parseCommentTree(things);
+			const added: RedditComment[] = [];
+			for (const comment of parsed.comments) {
+				if (loaded.has(comment.id)) continue;
+				loaded.add(comment.id);
+				added.push(comment);
+			}
+			thread.comments.push(...added);
+			commentsAdded += added.length;
+			remember(parsed.more);
+			store.saveComments(thread.post.id, thread.post.url, added);
+		} catch (error) {
+			stopped = signal?.aborted ? "Expansion cancelled." : compactWhitespace(error instanceof Error ? error.message : error, 240);
+			break;
+		}
+	}
+	const remaining = [...nodes.values()]
+		.map((node) => ({ ...node, children: node.children.filter((id) => !loaded.has(id)) }))
+		.filter((node) => node.stub || node.children.length > 0);
+	return {
+		more: { nodes: remaining, hiddenIds: new Set(remaining.flatMap((node) => node.children)).size, stubs: remaining.filter((node) => node.stub).length },
+		expansion: { comments_added: commentsAdded, requests, pending_ids: pendingIds(), unresolved_ids: [...attempted].filter((id) => !loaded.has(id)), stubs: remaining.filter((node) => node.stub).length },
+		expansion_stopped: stopped,
+	};
+}
+
 function topComments(comments: RedditComment[], limit: number, minLength = 20) {
 	return comments
 		.filter((comment) => comment.body.length >= minLength)
@@ -1135,10 +1291,12 @@ function topComments(comments: RedditComment[], limit: number, minLength = 20) {
 
 function formatPostLine(post: RedditPost, index: number) {
 	const flair = post.flair ? ` [${post.flair}]` : "";
+	const sticky = post.stickied ? " [sticky]" : "";
 	const nsfw = post.over18 ? " NSFW" : "";
 	const rank = post.rankScore !== undefined ? `, rank ${post.rankScore}` : "";
 	const reasons = post.rankReasons?.length ? ` (${post.rankReasons.join("; ")})` : "";
-	return `${index}. r/${post.subreddit}${flair}${nsfw} - ${post.title}\n   score ${post.score}, comments ${post.numComments}, age ${post.age}, by u/${post.author}${rank}${reasons}\n   ${post.url}`;
+	const destination = post.externalUrl ? `\n   destination: ${post.externalUrl}` : "";
+	return `${index}. r/${post.subreddit}${flair}${sticky}${nsfw} - ${post.title}\n   score ${post.score}, comments ${post.numComments}, age ${post.age}, by u/${post.author}${rank}${reasons}\n   ${post.url}${destination}`;
 }
 
 function formatPostExcerpt(post: RedditPost) {
@@ -1164,6 +1322,31 @@ function formatPosts(posts: RedditPost[], title: string) {
 		lines.push(formatPostExcerpt(post));
 	});
 	return lines.join("\n");
+}
+
+function formatPostListing(posts: RedditPost[], title: string, format: PostFormat, navigation: string) {
+	if (!posts.length) return { text: formatPosts(posts, title), shown: 0 };
+	const header = compactWhitespace(title, 240);
+	const blocks = posts.map((post, index) => {
+		if (format === "full") return `${formatPostLine(post, index + 1)}\n${formatPostExcerpt(post)}`;
+		const sticky = post.stickied ? " [sticky]" : "";
+		const nsfw = post.over18 ? " NSFW" : "";
+		const destination = post.externalUrl ? ` | destination ${post.externalUrl}` : "";
+		return `${index + 1}. r/${compactWhitespace(post.subreddit, 32)}${sticky}${nsfw} | score ${post.score}, comments ${post.numComments}, age ${post.age} | ${compactWhitespace(post.title, 140)} | ${post.url.replace(/[\r\n\t]/g, "")}${destination}`;
+	});
+	// Reuse limitOutput's exact footer reservation, but never slice a post entry.
+	const budget = maxOutputChars - limitOutput("", navigation).length;
+	const full = [header, ...blocks].join("\n");
+	if (full.length <= budget) return { text: full, shown: posts.length };
+	const notice = (shown: number) => `\n\n[truncated: showing ${shown} of ${posts.length}; use format=compact or lower limit before paginating. Full results remain in details.posts.]`;
+	let body = header;
+	let shown = 0;
+	for (const block of blocks) {
+		if (body.length + 1 + block.length + notice(shown + 1).length > budget) break;
+		body += `\n${block}`;
+		shown++;
+	}
+	return { text: body + notice(shown), shown };
 }
 
 function observedSubreddits(posts: RedditPost[]) {
@@ -1899,14 +2082,15 @@ export default function redditResearch(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "reddit_search",
 		label: "Reddit Search",
-		description: "Search Reddit posts and return a compact list without fetching comment threads.",
+		description: "Search up to 100 Reddit posts without fetching comment threads. Use format=compact for one-line entries; full is the default. Structured results retain all selected posts when text is shortened.",
 		promptSnippet: "Search Reddit posts by query, subreddit scope, sort, and time window",
 		parameters: Type.Object({
 			query: Type.String({ description: "Search query." }),
 			subreddits: Type.Optional(Type.String({ description: "Optional comma-separated subreddit names, for example: LocalLLaMA, LocalLLM, ClaudeCode. Do not pass a JSON list." })),
 			sort: Type.Optional(Type.String({ enum: [...sorts], description: "Sort: relevance, hot, top, new, comments. Default relevance." })),
 			time: Type.Optional(Type.String({ enum: [...times], description: "Time range. Default year." })),
-			limit: Type.Optional(Type.Number({ description: "Maximum posts. Default 8, max 25." })),
+			limit: Type.Optional(Type.Number({ description: "Maximum posts. Default 8, max 100." })),
+			format: Type.Optional(Type.String({ enum: [...postFormats], description: "Output format: full (default) or compact (one line per post). Does not change fetching or structured results." })),
 			after: Type.Optional(Type.String({ description: "Pagination cursor from a previous reddit_search result." })),
 		}),
 		prepareArguments(args) {
@@ -1916,7 +2100,8 @@ export default function redditResearch(pi: ExtensionAPI) {
 				subreddits: stringListParam(raw.subreddits),
 				sort: enumValue(raw.sort, sorts, "relevance"),
 				time: enumValue(raw.time, times, "year"),
-				limit: clampInt(raw.limit, 8, 1, 25),
+				limit: clampInt(raw.limit, 8, 1, 100),
+				format: enumValue(raw.format, postFormats, "full"),
 				after: optionalString(raw.after),
 			};
 		},
@@ -1927,25 +2112,28 @@ export default function redditResearch(pi: ExtensionAPI) {
 				subreddits: stringList(params.subreddits),
 				sort: enumValue(params.sort, sorts, "relevance"),
 				time: enumValue(params.time, times, "year"),
-				limit: clampInt(params.limit, 8, 1, 25),
+				limit: clampInt(params.limit, 8, 1, 100),
 				after: optionalString(params.after),
 				signal,
 			});
 			const scope = stringList(params.subreddits)?.map((s) => `r/${s}`).join(", ") ?? "all Reddit";
-			return textResult(formatPosts(posts, `Reddit posts for "${params.query}" in ${scope}`),
-				{ posts, cursors }, listingNavigation(cursors, "query/sort/time"));
+			const format = enumValue(params.format, postFormats, "full");
+			const navigation = listingNavigation(cursors, "query/sort/time/limit");
+			const output = formatPostListing(posts, `Reddit posts for "${params.query}" in ${scope}`, format, navigation);
+			return textResult(output.text, { posts, cursors, format, posts_shown: output.shown }, navigation);
 		},
 	});
 
 	pi.registerTool({
 		name: "reddit_thread",
 		label: "Reddit Thread",
-		description: "Fetch one Reddit thread by URL or post id and return compact post details plus top comments.",
+		description: "Fetch one Reddit thread with top comments and collapsed-branch reporting. Optionally expand hidden comments within an extra HTTP request budget. Fetching 500 comments can transfer about 1 MB; compact output still shows only top_comments.",
 		promptSnippet: "Read a specific Reddit thread and top comments by URL or post id",
 		parameters: Type.Object({
 			url_or_id: Type.String({ description: "Reddit post URL, permalink, or post id." }),
 			sort: Type.Optional(Type.String({ enum: ["top", "new", "controversial", "confidence"], description: "Comment sort. Default top." })),
-			comment_limit: Type.Optional(Type.Number({ description: "Comments requested from Reddit. Default 50, max 200." })),
+			comment_limit: Type.Optional(Type.Number({ description: "Comments requested from Reddit. Default 50, max 500 (can transfer about 1 MB)." })),
+			expand_more: Type.Optional(Type.Number({ description: "Maximum extra HTTP requests to expand collapsed comment ids. Default 0, max 5; each uncached request waits for the Reddit queue (~1.2 seconds by default). Continue-thread stubs are not expanded." })),
 			top_comments: Type.Optional(Type.Number({ description: "Top comments to show in compact output. Default 12, max 40." })),
 		}),
 		prepareArguments(args) {
@@ -1954,19 +2142,35 @@ export default function redditResearch(pi: ExtensionAPI) {
 			return {
 				url_or_id: String(normalizeString(raw.url_or_id) ?? ""),
 				sort: ["top", "new", "controversial", "confidence"].includes(sort ?? "") ? sort : "top",
-				comment_limit: clampInt(raw.comment_limit, 50, 1, 200),
+				comment_limit: clampInt(raw.comment_limit, 50, 1, 500),
+				expand_more: clampInt(raw.expand_more, 0, 0, 5),
 				top_comments: clampInt(raw.top_comments, 12, 1, 40),
 			};
 		},
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal) {
-			const thread = await getThread(params.url_or_id, (params.sort as RedditSort) ?? "top", clampInt(params.comment_limit, 50, 1, 200), signal);
+			const sort = (params.sort as RedditSort) ?? "top";
+			const budget = clampInt(params.expand_more, 0, 0, 5);
+			const thread = await getThread(params.url_or_id, sort, clampInt(params.comment_limit, 50, 1, 500), signal);
 			if (!thread.post) return textResult("No Reddit thread found.");
+			const expanded = await expandMore(thread, sort, budget, signal);
+			const notes: string[] = [];
+			if (expanded.more.nodes.length) {
+				notes.push(`not loaded: ${expanded.more.hiddenIds} known hidden comment ids in ${expanded.more.nodes.filter((node) => !node.stub).length} collapsed branches; continue-thread stubs: ${expanded.more.stubs} (not expanded).${expanded.more.hiddenIds ? " Pass expand_more=1..5 to try loading collapsed ids." : ""}`);
+			}
+			if (budget) {
+				const stats = expanded.expansion;
+				notes.push(`loaded +${stats.comments_added} comments in ${stats.requests} HTTP requests; pending ids: ${stats.pending_ids.length}; unresolved ids: ${stats.unresolved_ids.length}; continue-thread stubs: ${stats.stubs}. Counts of hidden ids are lower bounds, not exact unseen-comment totals.`);
+			}
+			if (expanded.expansion_stopped) notes.push(`expansion_stopped: ${expanded.expansion_stopped}`);
 			const lines = [formatPostLine(thread.post, 1), formatPostExcerpt(thread.post), formatComments(thread.comments, clampInt(params.top_comments, 12, 1, 40), "")];
 			return textResult(lines.join("\n"), {
 				post: thread.post,
 				comments: topComments(thread.comments, clampInt(params.top_comments, 12, 1, 40)),
-			});
+				comments_fetched: thread.comments.length,
+				more: expanded.more,
+				...(budget ? { expansion: expanded.expansion, expansion_stopped: expanded.expansion_stopped } : {}),
+			}, notes.join("\n"));
 		},
 	});
 
@@ -2107,7 +2311,8 @@ export default function redditResearch(pi: ExtensionAPI) {
 			listing: Type.Optional(Type.String({ enum: [...trendListings], description: "Listing type: hot, top, new, rising, controversial. Default hot." })),
 			order: Type.Optional(Type.String({ enum: [...trendOrders], description: "reddit preserves native order (round-robin across subreddits); ranked uses local relevance/engagement ranking. Default reddit for rising/controversial, ranked for hot/top/new." })),
 			time: Type.Optional(Type.String({ enum: [...times], description: "Time window for top and controversial only. Default week." })),
-			limit: Type.Optional(Type.Number({ description: "Maximum total posts. Default 10, max 30." })),
+			limit: Type.Optional(Type.Number({ description: "Maximum total posts. Default 10, max 100." })),
+			format: Type.Optional(Type.String({ enum: [...postFormats], description: "Output format: full (default) or compact (one line per post). Does not change fetching, ordering or structured results." })),
 			after: Type.Optional(Type.String({ description: "Pagination cursor from a previous reddit_trends result. Needs a single-subreddit scope." })),
 		}),
 		prepareArguments(args) {
@@ -2118,7 +2323,8 @@ export default function redditResearch(pi: ExtensionAPI) {
 				listing,
 				order: enumValue(raw.order, trendOrders, defaultTrendOrder(listing)),
 				time: enumValue(raw.time, times, "week"),
-				limit: clampInt(raw.limit, 10, 1, 30),
+				limit: clampInt(raw.limit, 10, 1, 100),
+				format: enumValue(raw.format, postFormats, "full"),
 				after: optionalString(raw.after),
 			};
 		},
@@ -2128,7 +2334,7 @@ export default function redditResearch(pi: ExtensionAPI) {
 			if (!subreddits.length) return textResult("Provide at least one subreddit.");
 			const listing = enumValue(params.listing, trendListings, "hot");
 			const order = enumValue(params.order, trendOrders, defaultTrendOrder(listing));
-			const limit = clampInt(params.limit, 10, 1, 30);
+			const limit = clampInt(params.limit, 10, 1, 100);
 			const after = optionalString(params.after);
 			const multiScope = subreddits.length > 1;
 			// Cursors are per listing: Reddit ignores a cursor sent to a multi-subreddit scope by
@@ -2159,11 +2365,18 @@ export default function redditResearch(pi: ExtensionAPI) {
 					for (const page of pages) if (page[i]) ordered.push(page[i]);
 				}
 			}
-			const posts = ordered.slice(0, limit);
+			const seen = new Set<string>();
+			const posts = ordered.filter((post) => {
+				if (seen.has(post.id)) return false;
+				seen.add(post.id);
+				return true;
+			}).slice(0, limit);
 			store.savePosts(posts);
 			const cursors = returnedListingCursors(listings, posts, Boolean(multiScope && after));
-			return textResult(formatPosts(posts, `Reddit ${listing} trends in ${subreddits.map((s) => `r/${s}`).join(", ")}`),
-				{ posts, cursors, order }, listingNavigation(cursors, "listing/time/order"));
+			const format = enumValue(params.format, postFormats, "full");
+			const navigation = listingNavigation(cursors, "listing/time/order/limit");
+			const output = formatPostListing(posts, `Reddit ${listing} trends in ${subreddits.map((s) => `r/${s}`).join(", ")}`, format, navigation);
+			return textResult(output.text, { posts, cursors, order, format, posts_shown: output.shown }, navigation);
 		},
 	});
 }
