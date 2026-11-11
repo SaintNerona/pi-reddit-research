@@ -36,10 +36,12 @@ Use the local Reddit tools when the user asks what people on Reddit say, recomme
 ## Thread Completeness
 
 - `reddit_thread.comment_limit` defaults to 50 and accepts up to 500; 500 can transfer about 1 MB. Compact output still selects `top_comments` (default 12, max 40), not every fetched comment.
-- A `not loaded:` line reports known hidden ids and collapsed branches. For deeper research, opt into `expand_more=1..5`: this caps extra HTTP requests, with at most 100 ids per request. It defaults to 0; do not expand every thread automatically.
+- A `not loaded:` line reports known hidden ids and collapsed branches. For deeper research, opt into `expand_more=1..5`: this caps the combined extra HTTP requests for child batches (at most 100 ids) and continue-thread lookups (at most 200 requested comments). It defaults to 0; do not expand every thread automatically.
 - Expansion follows nested placeholders, deduplicates comments and preserves parent ids/depth. Cache hits spend no HTTP budget; a result can add comments without making a new HTTP request.
 - Pending/unresolved ids are lower bounds, not exact unseen-comment totals. `expansion_stopped` means evidence is partial: report the limitation instead of claiming the entire discussion was reviewed.
-- Continue-thread stubs are reported but cannot be expanded yet. `reddit_pack` still uses its existing fetch behavior.
+- Continue-thread stubs run only after pending ordinary ids, within the same budget. A parent is attempted once per call; repeated/empty/failing branches remain reported rather than retried indefinitely. Cached continuations spend no HTTP budget. Resolved stubs do not prove full-thread coverage; check `stubs_resolved` and the remaining `unresolved_stubs` parents.
+- `sort="old"` fetches the oldest comments first; `sort="qa"` uses Reddit's Q&A ordering for AMA-style research. Both propagate to all expansion requests. Displayed `top_comments` still selects highest-score comments within the fetched set, not native fetched order. The default stays `top`.
+- `reddit_pack` still uses its existing fetch behavior. Comment-permalink subtree routing is not added; do not claim arbitrary selected-comment routing or that unresolved branches were read.
 
 ## Listing Volume and Post Context
 

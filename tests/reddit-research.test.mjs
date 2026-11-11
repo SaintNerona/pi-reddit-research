@@ -884,6 +884,10 @@ test('expand_more cannot exceed five HTTP requests even when every response reve
 test('expansion follows nested more, deduplicates overlap/descendants, preserves depth and reports unresolved ids', async () => {
   let batch = 0;
   respond = (url) => {
+    if (url.pathname.includes('/_/')) {
+      const parent = comment('childb'); Object.assign(parent.data, { parent_id: 't1_childa', depth: 0 });
+      return ok(threadPayload('nested1', [parent]));
+    }
     if (url.pathname !== '/api/morechildren') return ok(threadPayload('nested1', [comment('root001'), more(['childa', 'gone01']), more([], 't1_childb', 3)]));
     if (batch++ === 0) {
       const a = comment('childa'); Object.assign(a.data, { parent_id: 't1_root001', depth: 1, score: 10 });
@@ -904,7 +908,9 @@ test('expansion follows nested more, deduplicates overlap/descendants, preserves
   assert.deepEqual(result.details.expansion.pending_ids, []);
   assert.deepEqual(result.details.expansion.unresolved_ids, ['gone01']);
   assert.equal(result.details.more.hiddenIds, 1);
-  assert.equal(result.details.more.stubs, 1, 'same stub is not counted twice');
+  assert.equal(result.details.more.stubs, 0, 'duplicate stubs share one continuation lookup');
+  assert.equal(result.details.expansion.stubs_resolved, 1);
+  assert.equal(result.details.expansion.requests, 3, 'two child batches and one continuation share the budget');
   assert.equal(result.details.expansion_stopped, undefined);
 });
 
@@ -969,17 +975,21 @@ for (const kind of ['network', 'http', 'json-errors', 'malformed', 'invalid-json
   });
 }
 
-test('continue-thread-only and fully loaded threads do not spend an expansion budget', async () => {
-  respond = (url) => ok(threadPayload(url.pathname.split('/')[2].replace('.json', ''), url.pathname.includes('stub001') ? [more([], 't1_root', 4)] : [comment('full001')]));
+test('empty continuation is attempted once and stays unresolved; fully loaded threads spend no budget', async () => {
+  respond = (url) => ok(threadPayload(url.pathname.split('/')[2].replace('.json', ''), url.pathname.includes('/_/') ? []
+    : url.pathname.includes('stub001') ? [more([], 't1_root', 4)] : [comment('full001')]));
   const before = requests.length;
   const stub = await call('reddit_thread', { url_or_id: 'stub001', expand_more: 5 });
   assert.equal(stub.details.more.stubs, 1);
-  assert.equal(stub.details.expansion.requests, 0);
+  assert.equal(stub.details.expansion.requests, 1);
+  assert.equal(stub.details.expansion.stubs_resolved, 0);
+  assert.deepEqual(stub.details.expansion.unresolved_stubs, ['t1_root']);
   assert.equal(stub.details.more.hiddenIds, 0);
-  assert.doesNotMatch(text(stub), /Pass expand_more/);
+  assert.match(text(stub), /Pass expand_more/);
   const full = await call('reddit_thread', { url_or_id: 'full001', expand_more: 5 });
   assert.equal(full.details.expansion.requests, 0);
   assert.equal(full.details.more.nodes.length, 0);
+  assert.equal(requests.length - before, 3, 'initial stub, one continuation, and initial complete thread only');
   assert.equal(expansionRequests(before).length, 0);
 });
 
@@ -1044,6 +1054,299 @@ test('cancelling expansion keeps the fetched thread and does not fetch another b
   assert.equal(result.details.comments_fetched, 1);
   assert.equal(result.details.expansion.requests, 0);
   assert.equal(result.details.expansion_stopped, 'Expansion cancelled.');
+});
+
+const continuationRequests = (before) => requests.slice(before).filter((url) => url.pathname.includes('/_/'));
+const deepComment = (id, parent, depth, body) => {
+  const child = comment(id, body);
+  Object.assign(child.data, { parent_id: parent, depth });
+  return child;
+};
+
+for (const [index, mode] of ['relative', 'absolute', 'omitted', 'parent-omitted', 'absolute-parent-omitted', 'absolute-anchor-depth-omitted', 'absolute-anchor-child-depth-omitted', 'relative-anchor-depth-omitted', 'relative-anchor-child-depth-omitted'].entries()) {
+  test(`continuation ${mode} depths remain below the known depth-5 parent`, async () => {
+    const id = `depth${index}0`, parent = `par${index}abc`, kid = `kid${index}abc`, grand = `grn${index}abc`, tail = `tail${index}ab`;
+    respond = (url) => {
+      if (!url.pathname.includes('/_/')) return ok(threadPayload(id, [deepComment(parent, 't1_above00', 5), more([], `t1_${parent}`, 6)]));
+      const absolute = mode.startsWith('absolute');
+      const root = deepComment(parent, 't1_above00', absolute ? 5 : 0);
+      const child = deepComment(kid, `t1_${parent}`, absolute ? 6 : 1);
+      const leaf = deepComment(grand, `t1_${kid}`, absolute ? 7 : 2);
+      const hidden = more([tail], `t1_${kid}`, absolute ? 7 : 2);
+      child.data.replies = listing([leaf, hidden]);
+      root.data.replies = listing([child]);
+      if (mode === 'omitted') for (const item of [root, child, leaf, hidden]) delete item.data.depth;
+      if (mode.includes('anchor')) delete root.data.depth;
+      if (mode.includes('child-depth')) delete child.data.depth;
+      return ok(threadPayload(id, mode.includes('parent-omitted') ? [child] : [root]));
+    };
+    const before = requests.length;
+    const result = await call('reddit_thread', { url_or_id: id, expand_more: 1, top_comments: 40 });
+    assert.equal(result.details.comments_fetched, 3, 'already-loaded parent is not added again');
+    assert.equal(result.details.comments.find((c) => c.id === parent).depth, 5);
+    assert.equal(result.details.comments.find((c) => c.id === kid).depth, 6);
+    assert.equal(result.details.comments.find((c) => c.id === grand).depth, 7);
+    assert.equal(result.details.more.nodes.find((node) => node.children.includes(tail)).depth, 7);
+    assert.equal(result.details.more.stubs, 0);
+    assert.equal(result.details.expansion.stubs_resolved, 1);
+    assert.deepEqual(result.details.expansion.unresolved_stubs, []);
+    assert.deepEqual(result.details.expansion.pending_ids, [tail]);
+    assert.equal(result.details.expansion.requests, 1);
+    const [url] = continuationRequests(before);
+    assert.equal(url.pathname, `/comments/${id}/_/${parent}`);
+    assert.equal(url.searchParams.get('limit'), '200');
+    assert.equal(url.searchParams.get('sort'), 'top');
+    assert.equal(url.searchParams.get('raw_json'), '1');
+  });
+}
+
+test('continuation keeps a returned parent when it was not already loaded', async () => {
+  respond = (url) => {
+    if (!url.pathname.includes('/_/')) return ok(threadPayload('newpar1', [more([], 't1_newpar', 6)]));
+    const parent = deepComment('newpar', 't1_above00', 0);
+    parent.data.replies = listing([deepComment('newkid', 't1_newpar', 1)]);
+    return ok(threadPayload('newpar1', [parent]));
+  };
+  const result = await call('reddit_thread', { url_or_id: 'newpar1', expand_more: 1 });
+  assert.equal(result.details.comments_fetched, 2);
+  assert.equal(result.details.expansion.comments_added, 2);
+  assert.equal(result.details.comments.find((c) => c.id === 'newpar').depth, 5);
+  assert.equal(result.details.comments.find((c) => c.id === 'newkid').depth, 6);
+});
+
+test('deleted continuation ancestors do not hide surviving descendants or reset their depths', async () => {
+  respond = (url) => {
+    if (!url.pathname.includes('/_/')) return ok(threadPayload('delcont', [deepComment('delpar', 't1_above00', 5), more([], 't1_delpar', 6)]));
+    const root = deepComment('delpar', 't1_above00', 0, '[removed]');
+    const middle = deepComment('delmid', 't1_delpar', 1, '[deleted]');
+    middle.data.replies = listing([deepComment('delkeep', 't1_delmid', 2)]);
+    root.data.replies = listing([middle]);
+    return ok(threadPayload('delcont', [root]));
+  };
+  const result = await call('reddit_thread', { url_or_id: 'delcont', expand_more: 1 });
+  assert.equal(result.details.comments_fetched, 2);
+  assert.equal(result.details.comments.find((c) => c.id === 'delkeep').depth, 7);
+  assert.equal(result.details.comments.some((c) => c.id === 'delmid'), false);
+  assert.equal(result.details.more.stubs, 0);
+});
+
+test('absolute descendant depth survives missing depths on deleted continuation ancestors', async () => {
+  respond = (url) => {
+    if (!url.pathname.includes('/_/')) return ok(threadPayload('delmix1', [deepComment('delmixp', 't1_above00', 5), more([], 't1_delmixp', 6)]));
+    const root = deepComment('delmixp', 't1_above00', undefined, '[removed]');
+    const middle = deepComment('delmixm', 't1_delmixp', undefined, '[deleted]');
+    middle.data.replies = listing([deepComment('delmixk', 't1_delmixm', 7)]);
+    root.data.replies = listing([middle]);
+    return ok(threadPayload('delmix1', [root]));
+  };
+  const result = await call('reddit_thread', { url_or_id: 'delmix1', expand_more: 1 });
+  assert.equal(result.details.comments.find((c) => c.id === 'delmixk').depth, 7);
+  assert.equal(result.details.expansion.stubs_resolved, 1);
+});
+
+for (const [index, depth] of [6, 1].entries()) {
+  test(`explicit hidden-branch depth ${depth} survives an inferred anchor depth`, async () => {
+    const id = `moremix${index}`;
+    respond = (url) => {
+      if (!url.pathname.includes('/_/')) return ok(threadPayload(id, [deepComment('moremixp', `t3_${id}`, 5), more([], 't1_moremixp', 6)]));
+      const root = deepComment('moremixp', `t3_${id}`, undefined);
+      root.data.replies = listing([more(['moremixk'], 't1_moremixp', depth)]);
+      return ok(threadPayload(id, [root]));
+    };
+    const result = await call('reddit_thread', { url_or_id: id, expand_more: 1 });
+    assert.equal(result.details.more.nodes.find((node) => node.children.includes('moremixk')).depth, 6);
+    assert.equal(result.details.expansion.stubs_resolved, 1);
+  });
+}
+
+for (const [index, replies] of [null, false, 1, 'broken', [], {}, { data: {} }, { data: { children: 'broken' } }].entries()) {
+  test(`malformed continuation replies ${index} retain the unresolved stub`, async () => {
+    const id = `badrep${index}`;
+    respond = (url) => {
+      if (!url.pathname.includes('/_/')) return ok(threadPayload(id, [deepComment('badrepp', `t3_${id}`, 5), more([], 't1_badrepp', 6)]));
+      const root = deepComment('badrepp', `t3_${id}`, 0); root.data.replies = replies;
+      return ok(threadPayload(id, [root]));
+    };
+    const result = await call('reddit_thread', { url_or_id: id, expand_more: 1 });
+    assert.ok(result.details.expansion_stopped);
+    assert.equal(result.details.comments_fetched, 1);
+    assert.equal(result.details.expansion.stubs_resolved, 0);
+    assert.deepEqual(result.details.expansion.unresolved_stubs, ['t1_badrepp']);
+  });
+}
+
+for (const [index, replies] of [undefined, '', listing([])].entries()) {
+  test(`valid empty continuation replies ${index} resolve without a failure`, async () => {
+    const id = `okreply${index}`;
+    respond = (url) => {
+      if (!url.pathname.includes('/_/')) return ok(threadPayload(id, [deepComment('okreplyp', `t3_${id}`, 5), more([], 't1_okreplyp', 6)]));
+      const root = deepComment('okreplyp', `t3_${id}`, 0); root.data.replies = replies;
+      return ok(threadPayload(id, [root]));
+    };
+    const result = await call('reddit_thread', { url_or_id: id, expand_more: 1 });
+    assert.equal(result.details.expansion_stopped, undefined);
+    assert.equal(result.details.expansion.stubs_resolved, 1);
+    assert.deepEqual(result.details.expansion.unresolved_stubs, []);
+  });
+}
+
+test('ordinary ids always outrank continuation stubs, including newly revealed ids', async () => {
+  let batch = 0;
+  respond = (url) => {
+    if (url.pathname === '/api/morechildren') return ok(morePayload(batch++ === 0
+      ? [comment('prioid1'), more(['prioid2'], 't1_prioid1', 10)] : [comment('prioid2')]));
+    if (url.pathname.includes('/_/')) {
+      const root = deepComment('priopar', 't3_priocnt', 0);
+      root.data.replies = listing([deepComment('priokid', 't1_priopar', 1)]);
+      return ok(threadPayload('priocnt', [root]));
+    }
+    return ok(threadPayload('priocnt', [deepComment('priopar', 't3_priocnt', 0), more([], 't1_priopar', 1), more(['prioid1'], 't1_deeper', 9)]));
+  };
+  const before = requests.length;
+  const result = await call('reddit_thread', { url_or_id: 'priocnt', expand_more: 3 });
+  assert.deepEqual(requests.slice(before + 1).map((url) => url.pathname), ['/api/morechildren', '/api/morechildren', '/comments/priocnt/_/priopar']);
+  assert.equal(result.details.expansion.requests, 3);
+  assert.equal(result.details.expansion.stubs_resolved, 1);
+});
+
+test('continuation chains share the five-request cap and leave remaining stubs visible', async () => {
+  respond = (url) => {
+    if (!url.pathname.includes('/_/')) return ok(threadPayload('chainc1', [more([], 't1_chnp0', 1)]));
+    const index = Number(url.pathname.match(/chnp(\d+)$/)[1]);
+    const root = deepComment(`chnp${index}`, 't3_chainc1', 0);
+    const child = deepComment(`chnp${index + 1}`, `t1_chnp${index}`, 1);
+    child.data.replies = listing([more([], `t1_chnp${index + 1}`, 2)]);
+    root.data.replies = listing([child]);
+    return ok(threadPayload('chainc1', [root]));
+  };
+  const before = requests.length;
+  const result = await call('reddit_thread', { url_or_id: 'chainc1', expand_more: 999, top_comments: 40 });
+  assert.equal(continuationRequests(before).length, 5);
+  assert.equal(result.details.expansion.requests, 5);
+  assert.equal(result.details.expansion.stubs_resolved, 5);
+  assert.equal(result.details.more.stubs, 1);
+  assert.deepEqual(result.details.expansion.unresolved_stubs, ['t1_chnp5']);
+  assert.equal(result.details.comments.find((c) => c.id === 'chnp5').depth, 5);
+});
+
+test('cached continuations cost no HTTP budget and can lead to an uncached child batch', async () => {
+  respond = (url) => {
+    if (url.pathname === '/api/morechildren') return ok(morePayload([deepComment('cachecx', 't1_cacheck', 7)]));
+    if (!url.pathname.includes('/_/')) return ok(threadPayload('cachect', [deepComment('cachecp', 't1_above00', 5), more([], 't1_cachecp', 6)]));
+    const root = deepComment('cachecp', 't1_above00', 0);
+    const child = deepComment('cacheck', 't1_cachecp', 1);
+    child.data.replies = listing([more(['cachecx'], 't1_cacheck', 2)]);
+    root.data.replies = listing([child]);
+    return ok(threadPayload('cachect', [root]));
+  };
+  const first = await call('reddit_thread', { url_or_id: 'cachect', expand_more: 1 });
+  assert.equal(first.details.expansion.requests, 1);
+  assert.deepEqual(first.details.expansion.pending_ids, ['cachecx']);
+  const before = requests.length;
+  const second = await call('reddit_thread', { url_or_id: 'cachect', expand_more: 1 });
+  assert.equal(requests.length - before, 1);
+  assert.equal(expansionRequests(before).length, 1);
+  assert.equal(continuationRequests(before).length, 0);
+  assert.equal(second.details.expansion.requests, 1);
+  assert.equal(second.details.comments_fetched, 3);
+  const cachedBefore = requests.length;
+  const third = await call('reddit_thread', { url_or_id: 'cachect', expand_more: 1 });
+  assert.equal(requests.length, cachedBefore);
+  assert.equal(third.details.expansion.requests, 0);
+  assert.equal(third.details.comments.find((c) => c.id === 'cacheck').depth, 6);
+});
+
+test('repeated stubs are attempted only once and invalid parent ids never become request paths', async () => {
+  respond = (url) => {
+    if (url.pathname.includes('/_/')) return ok(threadPayload('repeatc', [deepComment('repeatp', 't3_repeatc', 0), more([], 't1_repeatp', 1)]));
+    return ok(threadPayload('repeatc', [deepComment('repeatp', 't3_repeatc', 0), more([], 't1_repeatp', 1), more([], 't1_repeatp', 2), more([], 't3_repeatc'), more([], 't1_../bad')]));
+  };
+  const before = requests.length;
+  const result = await call('reddit_thread', { url_or_id: 'repeatc', expand_more: 5 });
+  assert.equal(continuationRequests(before).length, 1);
+  assert.equal(result.details.more.stubs, 3, 'same parent is one stub even if reported at two depths');
+  assert.equal(result.details.expansion.stubs_resolved, 0);
+  assert.equal(result.details.expansion.requests, 1);
+  assert.ok(result.details.expansion.unresolved_stubs.includes('t1_repeatp'));
+  assert.equal(result.details.expansion_stopped, undefined);
+});
+
+for (const [index, kind] of ['network', 'http', 'wrong-post', 'wrong-branch', 'empty-array', 'null', 'invalid-node', 'nested-invalid', 'invalid-json'].entries()) {
+  test(`continuation ${kind} failure preserves prior expansion and reports unresolved stubs under truncation`, async () => {
+    const id = `ctfail${index}`;
+    respond = (url) => {
+      if (url.pathname === '/api/morechildren') return ok(morePayload([comment('priorok')]));
+      if (!url.pathname.includes('/_/')) return ok(threadPayload(id, [deepComment('failpar', 't1_above00', 5), more(['priorok']), more([], 't1_failpar', 6)], true));
+      if (kind === 'network') throw new Error('Synthetic continuation network failure.');
+      if (kind === 'http') return new Response('Synthetic continuation unavailable.', { status: 503 });
+      if (kind === 'wrong-post') return ok(threadPayload('otherid', [deepComment('failpar', 't1_above00', 0)]));
+      if (kind === 'wrong-branch') return ok(threadPayload(id, [comment('otherbranch')]));
+      if (kind === 'empty-array') return ok([]);
+      if (kind === 'null') return ok(null);
+      if (kind === 'invalid-node') return ok(threadPayload(id, [{ kind: 't1', data: {} }]));
+      if (kind === 'nested-invalid') {
+        const root = deepComment('failpar', 't1_above00', 0); root.data.replies = listing([{ kind: 't1', data: {} }]);
+        return ok(threadPayload(id, [root]));
+      }
+      return new Response('{invalid');
+    };
+    const before = requests.length;
+    const result = await call('reddit_thread', { url_or_id: id, expand_more: 5 });
+    assert.equal(result.details.comments_fetched, 2);
+    assert.equal(result.details.expansion.comments_added, 1);
+    assert.equal(result.details.expansion.requests, 2);
+    assert.equal(continuationRequests(before).length, 1);
+    assert.equal(result.details.more.stubs, 1);
+    assert.deepEqual(result.details.expansion.unresolved_stubs, ['t1_failpar']);
+    assert.ok(result.details.expansion_stopped);
+    assert.match(text(result), /truncated/);
+    assert.match(text(result), /expansion_stopped:/);
+    if (kind === 'wrong-post') {
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(join(cache, 'reddit.sqlite'));
+      try { assert.equal(db.prepare('SELECT post_id FROM comments WHERE id = ?').get('failpar').post_id, id, 'invalid continuation must not overwrite indexed evidence'); }
+      finally { db.close(); }
+    }
+  });
+}
+
+test('cancellation during a continuation counts its HTTP attempt and retains the initial thread', async () => {
+  const controller = new AbortController();
+  respond = (url) => {
+    if (!url.pathname.includes('/_/')) return ok(threadPayload('cancelc', [comment('cancelp'), more([], 't1_cancelp', 1)]));
+    controller.abort(new Error('Synthetic continuation cancellation.'));
+    throw controller.signal.reason;
+  };
+  const tool = extension.tools.get('reddit_thread').definition;
+  const before = requests.length;
+  const result = await tool.execute('cancel-continuation', tool.prepareArguments({ url_or_id: 'cancelc', expand_more: 5 }), controller.signal, undefined, {});
+  assert.equal(continuationRequests(before).length, 1);
+  assert.equal(result.details.expansion.requests, 1);
+  assert.equal(result.details.comments_fetched, 1);
+  assert.equal(result.details.more.stubs, 1);
+  assert.equal(result.details.expansion_stopped, 'Expansion cancelled.');
+});
+
+for (const [index, sort] of ['old', 'qa'].entries()) {
+  test(`${sort} is accepted consistently by thread, child batches and continuation requests`, async () => {
+    const id = `sortct${index}`;
+    respond = (url) => url.pathname === '/api/morechildren' ? ok(morePayload([comment('sortkid')]))
+      : ok(threadPayload(id, url.pathname.includes('/_/') ? [deepComment('sortpar', `t3_${id}`, 0)] : [comment('sortpar'), more(['sortkid']), more([], 't1_sortpar', 1)]));
+    const before = requests.length;
+    const result = await call('reddit_thread', { url_or_id: id, sort: ` ${sort.toUpperCase()} `, expand_more: 2 });
+    assert.equal(result.details.expansion.requests, 2);
+    assert.equal(result.details.more.stubs, 0);
+    assert.ok(requests.slice(before).every((url) => url.searchParams.get('sort') === sort));
+    assert.equal(expansionRequests(before).length, 1);
+    assert.equal(continuationRequests(before).length, 1);
+  });
+}
+
+test('new comment sorts retain the top default and do not broaden post-search sorts', () => {
+  const thread = extension.tools.get('reddit_thread').definition;
+  assert.equal(thread.prepareArguments({}).sort, 'top');
+  assert.equal(thread.prepareArguments({ sort: 'invalid' }).sort, 'top');
+  assert.equal(extension.tools.get('reddit_search').definition.prepareArguments({ sort: 'old' }).sort, 'relevance');
 });
 
 for (const [name, fallback] of [['reddit_search', 8], ['reddit_trends', 10]]) {
@@ -1321,4 +1624,30 @@ test('403 resource denials do not block unrelated uncached requests; block/rate-
   assert.equal(stale.details.expansion.requests, 0, 'stale helper successes are not fresh HTTP calls');
   assert.equal(stale.details.expansion.unresolved_ids.length, 50);
   assert.match(stale.details.expansion_stopped, /cooling down/);
+
+  now += 600000;
+  respond = (url) => {
+    now += 251;
+    if (url.searchParams.get('q') === 'continuation-rate-limit') return new Response('', { status: 429 });
+    if (url.pathname.includes('/_/')) {
+      const root = deepComment('stalecp', 't1_above00', 0);
+      const child = deepComment('staleck', 't1_stalecp', 1);
+      child.data.replies = listing([more(['stalecx'], 't1_staleck', 2)]);
+      root.data.replies = listing([child]);
+      return ok(threadPayload('stalect', [root]));
+    }
+    return ok(threadPayload('stalect', [deepComment('stalecp', 't1_above00', 5), more([], 't1_stalecp', 6)]));
+  };
+  await call('reddit_thread', { url_or_id: 'stalect', expand_more: 1 });
+  now += 21600001;
+  const blockedContinuation = await invoke(extension, 'reddit_search', { query: 'continuation-rate-limit' });
+  assert.equal(blockedContinuation.isError, true);
+  const beforeContinuation = requests.length;
+  const continued = await call('reddit_thread', { url_or_id: 'stalect', expand_more: 2 });
+  assert.equal(requests.length, beforeContinuation, 'stale continuation is replayed without HTTP; uncached ids still honor cooldown');
+  assert.equal(continued.details.expansion.requests, 0);
+  assert.equal(continued.details.expansion.stubs_resolved, 1);
+  assert.equal(continued.details.comments.find((c) => c.id === 'staleck').depth, 6);
+  assert.deepEqual(continued.details.expansion.unresolved_ids, ['stalecx']);
+  assert.match(continued.details.expansion_stopped, /cooling down/);
 });

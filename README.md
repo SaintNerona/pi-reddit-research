@@ -89,19 +89,25 @@ reddit_subreddit_info(names: "r/programming", include_rules: false)
 
 ### Thread completeness and comment expansion
 
+These comment-expansion changes are unreleased; the package version remains 0.2.0.
+
 ```
 reddit_thread(url_or_id: "POST_ID", comment_limit: 500)
 reddit_thread(url_or_id: "POST_ID", comment_limit: 50, expand_more: 2, top_comments: 20)
+reddit_thread(url_or_id: "POST_ID", sort: "old", expand_more: 2)
+reddit_thread(url_or_id: "AMA_POST_ID", sort: "qa", expand_more: 2)
 ```
 
 - `comment_limit` keeps its default of 50 and now accepts up to 500. A large response can transfer about 1 MB; `top_comments` still controls compact output (default 12, max 40). `details.comments_fetched` counts the visible, non-deleted comments parsed before that output selection.
 - With the default limit and `expand_more=0`, no extra requests are made. Raising `comment_limit` can increase response size. Collapsed placeholders are no longer silently discarded: a reserved `not loaded:` footer reports unique known hidden ids, collapsed branches and continue-thread stubs, even if the evidence text is truncated. `details.more` contains the remaining `nodes`, unique `hiddenIds` count and `stubs` count.
-- `expand_more` is an opt-in **extra HTTP request budget**, default 0, max 5. It requests at most 100 child ids per batch, favors shallow/larger branches, follows newly returned placeholders and deduplicates comments. Reddit may return additional descendants alongside those requested ids. It uses the same comment sort, request queue, authentication and thread cache. At the default queue delay, five uncached requests add roughly six seconds of spacing, plus network time.
-- Cached or stale expansion responses do not spend the HTTP budget; the summary reports actual fetch attempts, not helper calls. Cache reuse can therefore add comments with zero new HTTP requests. Repeating a request reconstructs the result from the cached initial thread and available expansion batches; it is not a persisted expansion cursor.
-- `details.expansion` reports `comments_added`, `requests`, `pending_ids` (known ids not yet attempted), `unresolved_ids` (attempted but no visible comment returned) and `stubs`. These id counts are **lower bounds**, not an exact unseen-comment total: one collapsed id can hide a subtree.
+- `expand_more` is an opt-in **extra HTTP request budget**, default 0, max 5, shared by hidden-child batches and continue-thread lookups. Child batches request at most 100 ids, favor shallow/larger branches, and always take priority over stubs. A continuation requests at most 200 comments; newly discovered child ids again take priority. Both paths use the same comment sort, serial queue, authentication and thread cache. At the default queue delay, five uncached requests add roughly six seconds of spacing, plus network time.
+- Cached responses, including stale responses served without a fetch during cooldown, do not spend the HTTP budget. Any actual fetch attempt counts, even if it fails or falls back to stale data; the summary counts fetch attempts, not helper calls. Cache reuse can therefore add comments with zero new HTTP requests. Repeating a request reconstructs the result from the cached initial thread and available expansion batches; it is not a persisted expansion cursor.
+- `details.expansion` reports `comments_added`, `requests`, `pending_ids` (known ids not yet attempted), `unresolved_ids` (attempted but no visible comment returned), and `stubs` (remaining continue-thread branches). `stubs_resolved` counts resolved branch lookups; `unresolved_stubs` lists every remaining parent, including unattempted or invalid/unfetchable parents. These counts are **lower bounds**, not an exact unseen-comment total: one collapsed id can hide a subtree.
 - Child-batch responses are validated before indexed evidence is updated. A malformed response cannot overwrite an existing comment's post ownership or insert unrelated thread data.
 - If expansion fails or is cancelled, already loaded evidence is kept and `details.expansion_stopped` and the compact footer explain why. This is a partial result, not proof that the thread was fully read.
-- Continue-thread stubs are counted but **not expanded** in this change. `reddit_pack` does not opt into expansion; its output and request behavior stay unchanged.
+- Continue-thread stubs can use the same budget. Each valid parent is attempted at most once per call; empty/repeated responses stay unresolved instead of looping. Returned parents are kept only if not already loaded, and deleted bodies are omitted without losing descendants. Rebasing distinguishes explicit depths from inferred ones, including when an ancestor's depth is missing; usable absolute comment/hidden-branch depths are preserved. Malformed reply containers retain the unresolved stub and report a stopped expansion. Both expansion endpoints are validated before indexed evidence is updated; continuations must also match the expected post/branch.
+- Comment sorts are `top` (default), `new`, `controversial`, `confidence`, `old` and `qa`. `old` asks Reddit for the oldest comments first; `qa` requests Reddit's Q&A ordering for AMA-style discussions. They apply to the initial fetch and both expansion endpoints. Compact output still selects highest-score `top_comments` from the fetched set; it does not preserve Reddit's fetched order.
+- `reddit_pack` does not opt into expansion; its request/depth behavior stays unchanged. Comment-permalink subtree routing is not added. No new dependencies, SQLite columns or authentication settings are required.
 
 ### Larger listings and post context (unreleased)
 
@@ -259,11 +265,13 @@ PI_REDDIT_DELAY_MS=2000 npm run smoke:live
 
 `npm run check` performs strict TypeScript checking and offline regression tests. Tests load the extension with Pi's actual loader, invoke its tools through Pi's agent loop (including argument preparation and validation), and exercise the default TUI renderer. Reddit HTTP responses and the model stream are synthetic in these tests.
 
+The live smoke checks `old`/`qa` sorts and uses a smoke-only depth restriction to expose continuation stubs for a shared-budget check when available.
+
 The live smoke also checks subreddit metadata/rules and isolated missing/restricted-community errors across all nine tools. Expected missing/restricted-community errors are checked for isolation rather than treated as smoke failures.
 
 The live smoke also exercises budgeted comment expansion, a 500-comment fetch, 100-result full/compact listings and post-context fields; stopped expansions fail validation.
 
-`npm run smoke:live` uses real Reddit HTTP with your existing cookie configuration, a fresh temporary SQLite cache, and the same Pi loader/agent loop. Only the model stream is synthetic; no LLM provider is called. Requests are paced at least two seconds apart (a larger `PI_REDDIT_DELAY_MS` is respected). It checks all eight tools, global/scoped search, API/public-link hosts, `raw_json=1` title preservation, and nonoverlapping second-page IDs for search, trends, user posts, and user comments when Reddit supplies cursors. Missing cursors are explicitly reported as unavailable checks. Deterministic offline fixtures also cover literal HTML/entity text.
+`npm run smoke:live` uses real Reddit HTTP with your existing cookie configuration, a fresh temporary SQLite cache, and the same Pi loader/agent loop. Only the model stream is synthetic; no LLM provider is called. Requests are paced at least two seconds apart (a larger `PI_REDDIT_DELAY_MS` is respected). It checks all nine tools, global/scoped search, API/public-link hosts, `raw_json=1` title preservation, and nonoverlapping second-page IDs for search, trends, user posts, and user comments when Reddit supplies cursors. Missing cursors are explicitly reported as unavailable checks. Deterministic offline fixtures also cover literal HTML/entity text.
 
 The temporary cache is removed when finished; credentials are never printed. The smoke runner observes actual HTTP statuses and blocks further network requests after the first 429, even if stale-cache fallback conceals it from a tool. HTTP errors, partial tool failures, or failed assertions exit nonzero and mean live validation is blocked/failed, not accepted. It prints whether the shipped User-Agent or an environment override is in use; for final-default acceptance, unset `PI_REDDIT_USER_AGENT` before running.
 

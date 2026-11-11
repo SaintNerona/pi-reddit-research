@@ -68,6 +68,7 @@ const showStatusFooter = ["1", "true", "yes", "on"].includes((process.env.PI_RED
 
 type JsonObject = Record<string, unknown>;
 type RedditSort = "relevance" | "hot" | "top" | "new" | "comments";
+type CommentSort = "top" | "new" | "controversial" | "confidence" | "old" | "qa";
 type RedditTime = "hour" | "day" | "week" | "month" | "year" | "all";
 type RedditDepth = "quick" | "normal" | "deep";
 type TrendListing = "hot" | "top" | "new" | "rising" | "controversial";
@@ -86,6 +87,7 @@ type RedditIntent =
 	| "general";
 
 const sorts = new Set<RedditSort>(["relevance", "hot", "top", "new", "comments"]);
+const commentSorts = new Set<CommentSort>(["top", "new", "controversial", "confidence", "old", "qa"]);
 const times = new Set<RedditTime>(["hour", "day", "week", "month", "year", "all"]);
 const depths = new Set<RedditDepth>(["quick", "normal", "deep"]);
 const trendListings = new Set<TrendListing>(["hot", "top", "new", "rising", "controversial"]);
@@ -1172,7 +1174,7 @@ async function searchPosts(params: {
 	return { posts: ranked, cursors };
 }
 
-async function getThread(urlOrId: string, sort: RedditSort, commentLimit: number, signal?: AbortSignal) {
+async function getThread(urlOrId: string, sort: RedditSort | CommentSort, commentLimit: number, signal?: AbortSignal) {
 	const id = extractPostId(urlOrId);
 	if (!id) throw new Error(`Could not extract Reddit post id from: ${urlOrId}`);
 	const commentsSort = sort === "relevance" || sort === "comments" ? "confidence" : sort;
@@ -1217,15 +1219,105 @@ function validateExpansionOwnership(things: JsonObject[], thread: ReturnType<typ
 	if (nodes.some((node) => !parents.has(node.parentId))) throw new Error("Reddit comment expansion contains an unrelated branch.");
 }
 
-async function expandMore(thread: ReturnType<typeof parseThread>, sort: RedditSort, budget: number, signal?: AbortSignal) {
+function parseContinuation(payload: unknown, thread: ReturnType<typeof parseThread>, stub: MoreNode) {
+	const items = Array.isArray(payload) ? payload : [];
+	const listing = (items[1] as JsonObject | undefined)?.data as JsonObject | undefined;
+	if (items.length !== 2 || !Array.isArray(listing?.children) || parsePosts(items[0])[0]?.id !== thread.post?.id) {
+		throw new Error("Malformed or mismatched Reddit continuation response.");
+	}
+	const roots = listing.children as JsonObject[];
+	const rawComments = new Map<string, { parentId?: string; depth: number; explicitDepth?: number }>();
+	const explicitMore: { parentId: string; depth: number }[] = [];
+	const visit = (children: JsonObject[], depth = 0, parentId?: string) => {
+		for (const item of children) {
+			if (!item || !["t1", "more"].includes(String(item.kind)) || !item.data || typeof item.data !== "object" || Array.isArray(item.data)) {
+				throw new Error("Malformed Reddit continuation response.");
+			}
+			const data = item.data as JsonObject;
+			const explicitDepth = typeof data.depth === "number" && Number.isInteger(data.depth) && data.depth >= 0 ? data.depth : undefined;
+			if (item.kind === "more") {
+				if (!Array.isArray(data.children)) throw new Error("Malformed Reddit continuation response.");
+				if (explicitDepth !== undefined) explicitMore.push({ parentId: optionalString(data.parent_id) ?? parentId ?? "", depth: explicitDepth });
+				continue;
+			}
+			const id = optionalString(data.id)?.replace(/^t1_/, "");
+			if (!id) throw new Error("Malformed Reddit continuation response.");
+			const nodeDepth = explicitDepth ?? depth;
+			rawComments.set(id, { parentId: optionalString(data.parent_id) ?? parentId, depth: nodeDepth, explicitDepth });
+			if (data.replies !== undefined && data.replies !== "") {
+				const replies = data.replies as JsonObject | null;
+				const listing = replies?.data as JsonObject | null | undefined;
+				if (!replies || typeof replies !== "object" || Array.isArray(replies) || !listing || typeof listing !== "object" || Array.isArray(listing) || !Array.isArray(listing.children)) {
+					throw new Error("Malformed Reddit continuation replies.");
+				}
+				visit(listing.children as JsonObject[], nodeDepth + 1, `t1_${id}`);
+			}
+		}
+	};
+	visit(roots);
+	const parsed = parseCommentTree(roots);
+	const parent = stub.parentId.slice(3);
+	const parentDepth = thread.comments.find((comment) => comment.id === parent)?.depth ?? Math.max(0, stub.depth - 1);
+	const reachable = new Set([stub.parentId]);
+	const distances = new Map([[stub.parentId, 0]]);
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const [id, comment] of rawComments) {
+			const fullname = `t1_${id}`;
+			if (comment.parentId && reachable.has(comment.parentId) && !reachable.has(fullname)) {
+				reachable.add(fullname);
+				distances.set(fullname, distances.get(comment.parentId)! + 1);
+				changed = true;
+			}
+		}
+	}
+	const comments = parsed.comments.filter((comment) => reachable.has(`t1_${comment.id}`));
+	const more = parsed.more.filter((node) => reachable.has(node.parentId));
+	const rawAnchor = rawComments.get(parent);
+	if (roots.length && !comments.length && !more.length && !rawAnchor) throw new Error("Reddit continuation response did not contain the requested branch.");
+	const anchorDepth = rawAnchor?.explicitDepth;
+	// An inferred anchor zero must not shift descendants with usable absolute depths.
+	const explicitFrames = [...rawComments].flatMap(([id, comment]) => id !== parent && comment.explicitDepth !== undefined && distances.has(`t1_${id}`)
+		? [{ depth: comment.explicitDepth, distance: distances.get(`t1_${id}`)! }] : []);
+	for (const node of explicitMore) {
+		if (distances.has(node.parentId)) explicitFrames.push({ depth: node.depth, distance: distances.get(node.parentId)! + 1 });
+	}
+	const nearestExplicit = explicitFrames.sort((a, b) => a.distance - b.distance)[0];
+	const inferredAnchor = nearestExplicit ? nearestExplicit.depth - nearestExplicit.distance : undefined;
+	const direct = comments.filter((comment) => comment.parentId === stub.parentId);
+	const offset = anchorDepth !== undefined ? parentDepth - anchorDepth
+		: inferredAnchor !== undefined ? Math.max(0, parentDepth - inferredAnchor)
+		: rawAnchor ? parentDepth - rawAnchor.depth
+		: Math.max(0, parentDepth + 1 - Math.min(...(direct.length ? direct.map((comment) => comment.depth) : more.map((node) => node.depth)), parentDepth + 1));
+	// Keep deleted ancestors in the depth graph even though their bodies are omitted.
+	const depths = new Map<string, number>([[stub.parentId, parentDepth]]);
+	const pending = [...rawComments].filter(([id]) => id !== parent && reachable.has(`t1_${id}`));
+	while (pending.length) {
+		const index = pending.findIndex(([, comment]) => comment.parentId && depths.has(comment.parentId));
+		if (index < 0) break;
+		const [id, comment] = pending.splice(index, 1)[0];
+		depths.set(`t1_${id}`, Math.max(0, comment.depth + offset, depths.get(comment.parentId!)! + 1));
+	}
+	for (const comment of comments) comment.depth = depths.get(`t1_${comment.id}`) ?? Math.max(0, comment.depth + offset);
+	for (const node of more) node.depth = Math.max(0, node.depth + offset, (depths.get(node.parentId) ?? -1) + 1);
+	return { comments, more, resolved: Boolean(rawAnchor || comments.length || more.some((node) => node.children.length)) && !more.some((node) => node.stub && node.parentId === stub.parentId) };
+}
+
+async function expandMore(thread: ReturnType<typeof parseThread>, sort: RedditSort | CommentSort, budget: number, signal?: AbortSignal) {
 	const loaded = new Set(thread.comments.map((comment) => comment.id));
 	const attempted = new Set<string>();
+	const attemptedStubs = new Set<string>();
+	const resolvedStubs = new Set<string>();
 	const nodes = new Map<string, MoreNode>();
 	let requests = 0;
 	let commentsAdded = 0;
 	let stopped: string | undefined;
 	const remember = (more: MoreNode[]) => {
-		for (const node of more) nodes.set(`${node.parentId}:${node.depth}:${node.children.join(",")}`, node);
+		for (const node of more) {
+			nodes.set(node.stub ? `stub:${node.parentId}` : `${node.parentId}:${node.depth}:${node.children.join(",")}`, node);
+			if (node.stub) resolvedStubs.delete(node.parentId);
+		}
 	};
 	remember(thread.more);
 	const pendingIds = () => [...new Set([...nodes.values()]
@@ -1235,28 +1327,44 @@ async function expandMore(thread: ReturnType<typeof parseThread>, sort: RedditSo
 	const commentsSort = sort === "relevance" || sort === "comments" ? "confidence" : sort;
 	while (requests < budget && thread.post) {
 		const batch = pendingIds().slice(0, 100);
-		if (!batch.length) break;
+		const stub = batch.length ? undefined : [...nodes.values()]
+			.filter((node) => node.stub && /^t1_[a-z0-9]{1,12}$/i.test(node.parentId) && !attemptedStubs.has(node.parentId))
+			.sort((a, b) => a.depth - b.depth)[0];
+		if (!batch.length && !stub) break;
 		try {
 			signal?.throwIfAborted();
 			for (const id of batch) attempted.add(id);
-			const path = `/api/morechildren.json?api_type=json&link_id=t3_${encodeURIComponent(thread.post.id)}&children=${encodeURIComponent(batch.join(","))}&sort=${encodeURIComponent(commentsSort)}`;
-			// Cached/stale responses do not spend the HTTP budget. Track the fetch boundary,
-			// not helper invocations; attempted ids still prevent cached empty-response loops.
-			// Validate the expansion envelope before updating any indexed evidence.
+			if (stub) attemptedStubs.add(stub.parentId);
+			const path = stub
+				? `/comments/${encodeURIComponent(thread.post.id)}/_/${encodeURIComponent(stub.parentId.slice(3))}.json?limit=200&sort=${encodeURIComponent(commentsSort)}`
+				: `/api/morechildren.json?api_type=json&link_id=t3_${encodeURIComponent(thread.post.id)}&children=${encodeURIComponent(batch.join(","))}&sort=${encodeURIComponent(commentsSort)}`;
+			// Both endpoints share the actual-fetch budget. Cache hits and attempted-parent
+			// tracking allow useful replay without spending HTTP or repeating empty stubs.
+			// Both expansion envelopes are validated before any indexed evidence update.
 			const payload = await fetchRedditJson(path, threadTtlMs, signal, () => { requests++; }, false);
-			const json = (payload as JsonObject | null)?.json as JsonObject | undefined;
-			const data = json?.data as JsonObject | undefined;
-			if (!json || !Array.isArray(json.errors)) throw new Error("Malformed Reddit comment expansion response.");
-			if (json.errors.length) throw new Error("Reddit returned comment expansion errors.");
-			if (!Array.isArray(data?.things)) throw new Error("Malformed Reddit comment expansion response.");
-			const things = data.things as JsonObject[];
-			if (things.some((thing) => !thing || !["t1", "more"].includes(String(thing.kind)) || !thing.data || typeof thing.data !== "object" || Array.isArray(thing.data)
-				|| (thing.kind === "t1" && !optionalString((thing.data as JsonObject).id))
-				|| (thing.kind === "more" && !Array.isArray((thing.data as JsonObject).children)))) {
-				throw new Error("Malformed Reddit comment expansion response.");
+			let parsed: ReturnType<typeof parseCommentTree>;
+			if (stub) {
+				const continued = parseContinuation(payload, thread, stub);
+				parsed = continued;
+				if (continued.resolved) {
+					nodes.delete(`stub:${stub.parentId}`);
+					resolvedStubs.add(stub.parentId);
+				}
+			} else {
+				const json = (payload as JsonObject | null)?.json as JsonObject | undefined;
+				const data = json?.data as JsonObject | undefined;
+				if (!json || !Array.isArray(json.errors)) throw new Error("Malformed Reddit comment expansion response.");
+				if (json.errors.length) throw new Error("Reddit returned comment expansion errors.");
+				if (!Array.isArray(data?.things)) throw new Error("Malformed Reddit comment expansion response.");
+				const things = data.things as JsonObject[];
+				if (things.some((thing) => !thing || !["t1", "more"].includes(String(thing.kind)) || !thing.data || typeof thing.data !== "object" || Array.isArray(thing.data)
+					|| (thing.kind === "t1" && !optionalString((thing.data as JsonObject).id))
+					|| (thing.kind === "more" && !Array.isArray((thing.data as JsonObject).children)))) {
+					throw new Error("Malformed Reddit comment expansion response.");
+				}
+				validateExpansionOwnership(things, thread, batch);
+				parsed = parseCommentTree(things);
 			}
-			validateExpansionOwnership(things, thread, batch);
-			const parsed = parseCommentTree(things);
 			const added: RedditComment[] = [];
 			for (const comment of parsed.comments) {
 				if (loaded.has(comment.id)) continue;
@@ -1277,7 +1385,8 @@ async function expandMore(thread: ReturnType<typeof parseThread>, sort: RedditSo
 		.filter((node) => node.stub || node.children.length > 0);
 	return {
 		more: { nodes: remaining, hiddenIds: new Set(remaining.flatMap((node) => node.children)).size, stubs: remaining.filter((node) => node.stub).length },
-		expansion: { comments_added: commentsAdded, requests, pending_ids: pendingIds(), unresolved_ids: [...attempted].filter((id) => !loaded.has(id)), stubs: remaining.filter((node) => node.stub).length },
+		expansion: { comments_added: commentsAdded, requests, pending_ids: pendingIds(), unresolved_ids: [...attempted].filter((id) => !loaded.has(id)), stubs: remaining.filter((node) => node.stub).length,
+			stubs_resolved: resolvedStubs.size, unresolved_stubs: remaining.filter((node) => node.stub).map((node) => node.parentId) },
 		expansion_stopped: stopped,
 	};
 }
@@ -2131,17 +2240,16 @@ export default function redditResearch(pi: ExtensionAPI) {
 		promptSnippet: "Read a specific Reddit thread and top comments by URL or post id",
 		parameters: Type.Object({
 			url_or_id: Type.String({ description: "Reddit post URL, permalink, or post id." }),
-			sort: Type.Optional(Type.String({ enum: ["top", "new", "controversial", "confidence"], description: "Comment sort. Default top." })),
+			sort: Type.Optional(Type.String({ enum: [...commentSorts], description: "Comment sort: top (default), new, controversial, confidence, old (oldest first), qa (Reddit's Q&A ordering for AMA-style discussions)." })),
 			comment_limit: Type.Optional(Type.Number({ description: "Comments requested from Reddit. Default 50, max 500 (can transfer about 1 MB)." })),
-			expand_more: Type.Optional(Type.Number({ description: "Maximum extra HTTP requests to expand collapsed comment ids. Default 0, max 5; each uncached request waits for the Reddit queue (~1.2 seconds by default). Continue-thread stubs are not expanded." })),
+			expand_more: Type.Optional(Type.Number({ description: "Maximum extra HTTP requests shared by hidden-comment batches and lower-priority continue-thread lookups. Default 0, max 5; each uncached request waits for the Reddit queue (~1.2 seconds by default)." })),
 			top_comments: Type.Optional(Type.Number({ description: "Top comments to show in compact output. Default 12, max 40." })),
 		}),
 		prepareArguments(args) {
 			const raw = (args && typeof args === "object" ? args : {}) as JsonObject;
-			const sort = optionalString(raw.sort)?.toLowerCase();
 			return {
 				url_or_id: String(normalizeString(raw.url_or_id) ?? ""),
-				sort: ["top", "new", "controversial", "confidence"].includes(sort ?? "") ? sort : "top",
+				sort: enumValue(raw.sort, commentSorts, "top"),
 				comment_limit: clampInt(raw.comment_limit, 50, 1, 500),
 				expand_more: clampInt(raw.expand_more, 0, 0, 5),
 				top_comments: clampInt(raw.top_comments, 12, 1, 40),
@@ -2149,18 +2257,18 @@ export default function redditResearch(pi: ExtensionAPI) {
 		},
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal) {
-			const sort = (params.sort as RedditSort) ?? "top";
+			const sort = enumValue(params.sort, commentSorts, "top");
 			const budget = clampInt(params.expand_more, 0, 0, 5);
 			const thread = await getThread(params.url_or_id, sort, clampInt(params.comment_limit, 50, 1, 500), signal);
 			if (!thread.post) return textResult("No Reddit thread found.");
 			const expanded = await expandMore(thread, sort, budget, signal);
 			const notes: string[] = [];
 			if (expanded.more.nodes.length) {
-				notes.push(`not loaded: ${expanded.more.hiddenIds} known hidden comment ids in ${expanded.more.nodes.filter((node) => !node.stub).length} collapsed branches; continue-thread stubs: ${expanded.more.stubs} (not expanded).${expanded.more.hiddenIds ? " Pass expand_more=1..5 to try loading collapsed ids." : ""}`);
+				notes.push(`not loaded: ${expanded.more.hiddenIds} known hidden comment ids in ${expanded.more.nodes.filter((node) => !node.stub).length} collapsed branches; continue-thread stubs: ${expanded.more.stubs} (${budget ? "unresolved" : "not expanded"}).${expanded.more.hiddenIds || expanded.more.stubs ? " Pass expand_more=1..5 to try loading collapsed ids and continue-thread branches." : ""}`);
 			}
 			if (budget) {
 				const stats = expanded.expansion;
-				notes.push(`loaded +${stats.comments_added} comments in ${stats.requests} HTTP requests; pending ids: ${stats.pending_ids.length}; unresolved ids: ${stats.unresolved_ids.length}; continue-thread stubs: ${stats.stubs}. Counts of hidden ids are lower bounds, not exact unseen-comment totals.`);
+				notes.push(`loaded +${stats.comments_added} comments in ${stats.requests} HTTP requests; pending ids: ${stats.pending_ids.length}; unresolved ids: ${stats.unresolved_ids.length}; continue-thread stubs: ${stats.stubs}; resolved stubs: ${stats.stubs_resolved}. Counts of hidden ids are lower bounds, not exact unseen-comment totals.`);
 			}
 			if (expanded.expansion_stopped) notes.push(`expansion_stopped: ${expanded.expansion_stopped}`);
 			const lines = [formatPostLine(thread.post, 1), formatPostExcerpt(thread.post), formatComments(thread.comments, clampInt(params.top_comments, 12, 1, 40), "")];

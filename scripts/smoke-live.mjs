@@ -182,6 +182,9 @@ try {
       const ids = url.searchParams.get('children').split(',');
       assert.ok(ids.length <= 100, 'Expansion exceeded 100 ids per request');
       batches.push(ids.length);
+    } else if (url.pathname.includes('/_/')) {
+      expansionHttp++;
+      assert.equal(url.searchParams.get('limit'), '200');
     }
     return originalFetch(input, options);
   };
@@ -200,6 +203,39 @@ try {
   const largeThread = await call('reddit_thread', { url_or_id: discussion.id, comment_limit: 500, top_comments: 2 });
   assert.ok(largeThread.details.comments_fetched > 0);
   console.log(`500-comment fetch: ${largeThread.details.comments_fetched} visible comments parsed`);
+  for (const sort of ['old', 'qa']) {
+    const sorted = await call('reddit_thread', { url_or_id: discussion.id, sort, comment_limit: 30, top_comments: 2 });
+    assert.equal(sorted.details.post.id, discussion.id);
+    assert.ok(sorted.details.comments_fetched >= 0);
+    console.log(`comment sort ${sort}: ${sorted.details.comments_fetched} visible comments parsed`);
+  }
+  // A real depth-limited response exposes continuation stubs without inventing fixture data.
+  // This depth parameter is smoke-only; it is not a new public tool argument.
+  const continuationFetch = globalThis.fetch;
+  let continuationHttp = 0, continuationExtras = 0;
+  globalThis.fetch = (input, options) => {
+    const url = new URL(input);
+    if (url.pathname === `/comments/${discussion.id}`) url.searchParams.set('depth', '1');
+    if (url.pathname.includes('/_/')) { continuationHttp++; continuationExtras++; }
+    else if (url.pathname === '/api/morechildren') continuationExtras++;
+    return continuationFetch(url, options);
+  };
+  try {
+    const args = { url_or_id: discussion.id, sort: 'old', comment_limit: 500, top_comments: 40 };
+    const shallow = await call('reddit_thread', args);
+    if (shallow.details.more.stubs) {
+      const continued = await call('reddit_thread', { ...args, expand_more: 5 });
+      assert.ok(continuationExtras > 0 && continuationExtras <= 5);
+      assert.equal(continued.details.expansion.requests, continuationExtras);
+      assert.ok(continued.details.comments_fetched >= shallow.details.comments_fetched);
+      assert.equal(new Set(continued.details.comments.map((c) => c.id)).size, continued.details.comments.length);
+      if (continuationHttp) {
+        console.log(`continue-thread: ${continuationHttp} lookups in ${continuationExtras} shared extra HTTP requests; ${continued.details.expansion.stubs_resolved} resolved; ${continued.details.more.stubs} remain`);
+      } else console.log('Continuation lookups unavailable in live budget: ordinary hidden ids consumed it; fixtures cover stub fetching.');
+    } else console.log('No continuation stubs in the live depth-limited response; fixtures cover stub fetching.');
+  } finally {
+    globalThis.fetch = continuationFetch;
+  }
   const pack = await call('reddit_pack', { topic: 'python', subreddits: 'learnpython', depth: 'quick', max_posts: 2, comments_per_post: 2 });
   assert.ok(pack.details.posts.length > 0);
   assert.ok(pack.details.commented_post_count > 0);
