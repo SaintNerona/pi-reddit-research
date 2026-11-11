@@ -606,6 +606,208 @@ test('trends preparation normalizes listing/order and defaults invalid values sa
   assert.equal(tool.prepareArguments({ listing: 'best' }).listing, 'hot');
 });
 
+for (const [name, fallback] of [['reddit_search', 8], ['reddit_trends', 10]]) {
+  test(`${name} keeps default limits, caps at 100 and normalizes output format`, async () => {
+    const tool = extension.tools.get(name).definition;
+    assert.equal(tool.prepareArguments({}).limit, fallback);
+    assert.equal(tool.prepareArguments({}).format, 'full');
+    assert.equal(tool.prepareArguments({ limit: 101, format: ' COMPACT ' }).limit, 100);
+    assert.equal(tool.prepareArguments({ format: ' COMPACT ' }).format, 'compact');
+    assert.equal(tool.prepareArguments({ limit: 0, format: 'invalid' }).limit, 1);
+    assert.equal(tool.prepareArguments({ format: 'invalid' }).format, 'full');
+    respond = (url) => ok(listing(Array.from({ length: Number(url.searchParams.get('limit')) }, (_, i) => post(`wide${i}`, 'Wide')), 't3_wide99'));
+    const before = requests.length;
+    const result = await call(name, { query: `volume-${name}`, subreddits: `Volume${fallback}`, limit: 100, format: 'full' });
+    const compact = await call(name, { query: `volume-${name}`, subreddits: `Volume${fallback}`, limit: 100, format: 'compact' });
+    assert.equal(requests[before].searchParams.get('limit'), '100');
+    assert.equal(requests.length - before, 1, 'format changes reuse the same request cache');
+    assert.equal(result.details.posts.length, 100);
+    assert.equal(compact.details.posts.length, 100);
+    assert.deepEqual(compact.details.posts, result.details.posts);
+    assert.deepEqual(compact.details.cursors, result.details.cursors);
+    assert.equal(result.details.format, 'full');
+    assert.equal(compact.details.format, 'compact');
+    assert.ok(compact.details.posts_shown > result.details.posts_shown);
+    assert.match(text(result), /showing \d+ of 100; use format=compact or lower limit before paginating/);
+    assert.match(text(compact), /Full results remain in details.posts/);
+    assert.match(text(compact), /after=t3_wide99/);
+  });
+
+  for (const format of ['full', 'compact']) {
+    test(`${name} ${format} truncates only between complete entries`, async () => {
+      respond = () => ok(listing(Array.from({ length: 30 }, (_, i) => post(`whole${i}`, 'Whole')), 't3_whole29'));
+      const result = await call(name, { query: `whole-${name}-${format}`, subreddits: `Whole${name}${format}`, limit: 30, format });
+      const evidence = text(result).split('\n\n[truncated:')[0];
+      const entries = evidence.split(/\n(?=\d+\. r\/)/).slice(1);
+      assert.equal(entries.length, result.details.posts_shown);
+      assert.ok(entries.length > 0 && entries.length < 30);
+      assert.equal(result.details.posts.length, 30);
+      for (const entry of entries) {
+        if (format === 'full') {
+          assert.equal(entry.split('\n').length, 4);
+          assert.match(entry.split('\n').at(-1), /^   post excerpt: /);
+        } else {
+          assert.equal(entry.split('\n').length, 1);
+          assert.match(entry, /score \d+, comments 4, age .+ \| source whole\d+ \| https:\/\/www\.reddit\.com\//);
+        }
+      }
+      assert.doesNotMatch(text(result), /truncated to 2000/);
+      assert.match(text(result), /after=t3_whole29/);
+    });
+  }
+
+  test(`${name} reports zero displayed entries for an oversized full post without hiding structured data`, async () => {
+    const child = post('oversize', 'Oversize');
+    child.data.title = 'very large title '.repeat(1000);
+    respond = () => ok(listing([child], 't3_oversize'));
+    const args = { query: `oversize-${name}`, subreddits: `Oversize${name}`, limit: 1 };
+    const full = await call(name, args);
+    assert.equal(full.details.posts_shown, 0);
+    assert.equal(full.details.posts.length, 1);
+    assert.match(text(full), /showing 0 of 1/);
+    assert.doesNotMatch(text(full), /^1\. r\//m);
+    const compact = await call(name, { ...args, format: 'compact' });
+    assert.equal(compact.details.posts_shown, 1);
+    assert.deepEqual(compact.details.posts, full.details.posts);
+  });
+
+  test(`${name} paginates 100-result compact pages without overlapping ids`, async () => {
+    respond = (url) => {
+      const start = url.searchParams.has('after') ? 100 : 0;
+      return ok(listing(Array.from({ length: 100 }, (_, i) => post(`bulk${start + i}`, 'Bulk')), start === 0 ? 't3_bulk99' : undefined));
+    };
+    const args = { query: `bulk-pages-${name}`, subreddits: `Bulk${name}`, limit: 100, format: 'compact' };
+    const before = requests.length;
+    const first = await call(name, args);
+    const second = await call(name, { ...args, after: first.details.cursors.after });
+    assert.equal(first.details.posts.length, 100);
+    assert.equal(second.details.posts.length, 100);
+    assert.equal(first.details.cursors.after, 't3_bulk99');
+    assert.equal(second.details.cursors.after, undefined);
+    const seen = new Set(first.details.posts.map((post) => post.id));
+    assert.ok(second.details.posts.every((post) => !seen.has(post.id)));
+    assert.equal(requests.length - before, 2);
+    assert.equal(requests[before + 1].searchParams.get('after'), 't3_bulk99');
+  });
+
+  test(`${name} handles empty compact results and preserves default full output`, async () => {
+    respond = () => ok(listing([]));
+    const empty = await call(name, { query: `empty-format-${name}`, subreddits: `EmptyFormat${name}`, format: 'compact' });
+    assert.equal(empty.details.posts_shown, 0);
+    assert.deepEqual(empty.details.posts, []);
+    assert.match(text(empty), /No Reddit posts found/);
+    respond = () => ok(listing([post('legacyformat')]));
+    const before = requests.length;
+    const full = await call(name, { query: `legacy-format-${name}`, subreddits: `LegacyFormat${name}` });
+    assert.equal(requests[before].searchParams.get('limit'), String(fallback));
+    assert.equal(full.details.format, 'full');
+    assert.match(text(full), /by u\/testuser/);
+    assert.match(text(full), /post excerpt: body evidence/);
+  });
+}
+
+for (const order of ['reddit', 'ranked']) {
+  test(`trends ${order} deduplicates ids before applying the result cap and keeps safe cursors`, async () => {
+    respond = (url) => {
+      const first = url.pathname.includes('/DupA/');
+      return ok(listing(first ? [post('sharedid', 'Actual', 1), post('uniquea', 'Actual', 10), post('uniquea', 'Actual', 10)]
+        : [post('sharedid', 'Actual', 1), post('uniqueb', 'Actual', 9)], first ? 't3_uniquea' : 't3_uniqueb'));
+    };
+    const result = await call('reddit_trends', { subreddits: 'DupA,DupB', listing: 'hot', order, limit: 3, format: 'compact' });
+    assert.equal(result.details.posts.length, 3);
+    assert.deepEqual(result.details.posts.map((p) => p.id), order === 'reddit' ? ['sharedid', 'uniquea', 'uniqueb'] : ['uniquea', 'uniqueb', 'sharedid']);
+    assert.equal(result.details.cursors.per_subreddit.DupA.after, 't3_uniquea');
+    assert.equal(result.details.cursors.per_subreddit.DupB.after, 't3_uniqueb');
+  });
+}
+
+test('compact multi-subreddit searches retain unreturned-prefix cursors and formatting does not change them', async () => {
+  respond = (url) => ok(listing(url.pathname.includes('/FormatA/')
+    ? [post('fmta1', 'FormatA', 100000), post('fmta2', 'FormatA', 99999)]
+    : [post('fmtb1', 'FormatB', 0), post('fmtb2', 'FormatB', 99998)], 't3_pageend'));
+  const args = { query: 'format-safe-multi', subreddits: 'FormatA,FormatB', limit: 1, after: 't3_ignored' };
+  const full = await call('reddit_search', args);
+  const compact = await call('reddit_search', { ...args, format: 'compact' });
+  assert.deepEqual(compact.details.cursors, full.details.cursors);
+  assert.equal(compact.details.cursors.per_subreddit.FormatA.after, 't3_fmta1');
+  assert.equal(compact.details.cursors.per_subreddit.FormatB.restart, true);
+  assert.match(text(compact), /after was ignored/);
+});
+
+test('post context preserves Reddit permalinks and only valid non-reddit.com destinations', async () => {
+  const cases = [
+    ['external', { url: 'https://example.com/article?q=1', stickied: true, is_video: true }, 'https://example.com/article?q=1'],
+    ['selfpost', { is_self: true, url: 'https://example.com/not-a-destination' }],
+    ['redditroot', { url: 'https://reddit.com/comments/abc' }],
+    ['redditsub', { url: 'https://old.reddit.com/comments/abc' }],
+    ['redditdot', { url: 'https://REDDIT.COM./comments/abc' }],
+    ['lookalike', { url: 'https://reddit.com.example.org/article' }, 'https://reddit.com.example.org/article'],
+    ['cdnlink', { url: 'https://i.redd.it/example.png' }, 'https://i.redd.it/example.png'],
+    ['invalid', { url: 'not an absolute URL' }],
+    ['relative', { url: '/relative/path' }],
+    ['scripturl', { url: 'javascript:alert(1)' }],
+    ['userinfo', { url: 'https://user:example@example.com/article' }],
+    ['missing', {}],
+    ['malformedflags', { is_self: 'false', stickied: 'true', is_video: 1 }],
+  ];
+  respond = () => ok(listing(cases.map(([id, fields]) => {
+    const child = post(id, 'Context');
+    Object.assign(child.data, fields);
+    return child;
+  })));
+  const result = await call('reddit_search', { query: 'post-context', limit: 25, format: 'compact' });
+  for (const [id, fields, destination] of cases) {
+    const parsed = result.details.posts.find((p) => p.id === id);
+    assert.equal(parsed.externalUrl, destination, id);
+    assert.equal(parsed.url, `https://www.reddit.com/r/Context/comments/${id}/source/`, id);
+    assert.equal(parsed.permalink, `/r/Context/comments/${id}/source/`, id);
+    assert.equal(parsed.isSelf, fields.is_self === true, id);
+    assert.equal(parsed.stickied, fields.stickied === true, id);
+    assert.equal(parsed.isVideo, fields.is_video === true, id);
+  }
+  assert.match(text(result), /\[sticky\]/);
+  assert.match(text(result), /destination https:\/\/example.com\/article\?q=1/);
+});
+
+test('external destinations and sticky markers render in full, compact, thread and user output', async () => {
+  const child = post('linkrender', 'LinkRender');
+  Object.assign(child.data, { url: 'https://example.org/guide', is_self: false, stickied: true, is_video: true, title: 'Guide\nwith\tspacing' });
+  respond = (url) => ok(url.pathname.startsWith('/comments/') ? [listing([child]), listing([])] : listing([child]));
+  const full = await call('reddit_search', { query: 'link-rendering' });
+  const compact = await call('reddit_search', { query: 'link-rendering', format: 'compact' });
+  const thread = await call('reddit_thread', { url_or_id: 'linkrender' });
+  const user = await call('reddit_user', { username: 'linkauthor', sections: 'posts' });
+  for (const result of [full, compact, thread, user]) {
+    assert.match(text(result), /\[sticky\]/);
+    assert.match(text(result), /destination[: ]+https:\/\/example.org\/guide/);
+    assert.match(text(result), /https:\/\/www.reddit.com\/r\/LinkRender\/comments\/linkrender\/source\//);
+  }
+  assert.match(text(compact), /Guide with spacing/);
+  assert.equal(text(compact).split('\n').filter((line) => /^\d+\. r\//.test(line)).length, 1);
+  const { initTheme } = await import(pathToFileURL(join(piDist, 'modes/interactive/theme/theme.js')));
+  const { ToolExecutionComponent } = await import(pathToFileURL(join(piDist, 'modes/interactive/components/tool-execution.js')));
+  initTheme('dark', false);
+  for (const result of [full, compact]) {
+    const component = new ToolExecutionComponent('reddit_search', 'link-render', { query: 'link-rendering', format: result.details.format }, {},
+      extension.tools.get('reddit_search').definition, { requestRender() {} }, process.cwd());
+    component.updateResult(result);
+    assert.ok(component.render(100).length > 0);
+    component.setExpanded(true);
+    assert.ok(component.render(100).length > 0);
+  }
+});
+
+test('oversized compact destinations never produce partial entries or exceed the output budget', async () => {
+  const child = post('hugeurl', 'HugeUrl');
+  child.data.url = `https://example.com/${'x'.repeat(5000)}`;
+  respond = () => ok(listing([child]));
+  const result = await call('reddit_search', { query: 'oversized-destination', format: 'compact' });
+  assert.equal(result.details.posts_shown, 0);
+  assert.equal(result.details.posts[0].externalUrl.length > 5000, true);
+  assert.match(text(result), /showing 0 of 1/);
+  assert.doesNotMatch(text(result), /^1\. r\//m);
+});
+
 test('403 resource denials do not block unrelated uncached requests; block/rate-limit behavior is preserved', async (t) => {
   // All requests below are synthetic. A controlled clock expires each case's cooldown
   // without waiting five real minutes or letting one case contaminate the next.

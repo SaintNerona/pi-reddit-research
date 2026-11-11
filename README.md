@@ -68,6 +68,22 @@ reddit_trends(subreddits: "popular", listing: "new", order: "reddit")
 - `all` and `popular` use the existing subreddit listing path, not your personalized home feed. Reddit may filter their results; do not treat either as exhaustive.
 - Pagination works as before; reuse the same listing, scope, time **and order**.
 
+### Larger listings and post context (unreleased)
+
+```text
+reddit_search(query: "python packaging", subreddits: "Python", limit: 100, format: "compact")
+reddit_trends(subreddits: "all", listing: "hot", order: "reddit", limit: 100, format: "compact")
+```
+
+- `reddit_search.limit` and `reddit_trends.limit` accept up to **100** posts. Defaults remain **8** and **10**; one call fetches one page per requested scope, not an automatic multi-page crawl. Reddit may return fewer posts or no next cursor. Post IDs are deduplicated before applying the result cap.
+- `format="full"` remains the default, including post excerpts. `format="compact"` uses one line per displayed post: subreddit, score, comment count, age, bounded title and Reddit source URL, plus any external destination. Format changes do not change fetching or trend ordering and reuse the same request cache.
+- Long output stops between complete entries instead of cutting a post in half. A `showing K of N; use format=compact or lower limit` notice reports the displayed count. `details.posts` retains all **N** selected results; `details.posts_shown` is **K**, and `details.format` identifies the presentation. A single oversized entry may show zero posts while preserving its structured data.
+- Cursors describe the complete structured result selection, not just the printed entries. If text was shortened, re-run the same page with compact output or a lower limit before paging past unread evidence; format changes alone do not spend another HTTP request while the response is fresh. Keep query/scope/sort/time/order and limit consistent during pagination.
+- Posts preserve `url` as the Reddit permalink. `externalUrl`, when available, is an absolute HTTP(S) destination outside `reddit.com` and its subdomains, for non-self posts only. Invalid destinations and URLs containing user credentials are omitted; Reddit CDN links such as `i.redd.it` may still be destinations.
+- Structured post data also includes `isSelf`, `stickied` and `isVideo`. Output marks sticky posts with `[sticky]` and shows external destinations without replacing source links. Shared thread, account and research-pack output receives this context too; their request/depth limits are unchanged. No new SQLite columns or authentication settings are required.
+
+These listing options are not included in the published 0.2.0 package. Comment-expansion and subreddit-metadata changes remain separate work.
+
 ### Pagination
 
 Listing tools return a `next page: pass after=...` line when Reddit supplied a cursor. Pass that value back as `after` with the same query/scope/sort/time (and the same `username` for `reddit_user`) to fetch the next page:
@@ -207,6 +223,8 @@ PI_REDDIT_DELAY_MS=2000 npm run smoke:live
 ```
 
 `npm run check` performs strict TypeScript checking and offline regression tests. Tests load the extension with Pi's actual loader, invoke its tools through Pi's agent loop (including argument preparation and validation), and exercise the default TUI renderer. Reddit HTTP responses and the model stream are synthetic in these tests.
+
+The live smoke also exercises 100-result full/compact listings and post-context fields.
 
 `npm run smoke:live` uses real Reddit HTTP with your existing cookie configuration, a fresh temporary SQLite cache, and the same Pi loader/agent loop. Only the model stream is synthetic; no LLM provider is called. Requests are paced at least two seconds apart (a larger `PI_REDDIT_DELAY_MS` is respected). It checks all eight tools, global/scoped search, API/public-link hosts, `raw_json=1` title preservation, and nonoverlapping second-page IDs for search, trends, user posts, and user comments when Reddit supplies cursors. Missing cursors are explicitly reported as unavailable checks. Deterministic offline fixtures also cover literal HTML/entity text.
 
