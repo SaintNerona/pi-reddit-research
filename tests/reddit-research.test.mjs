@@ -4,6 +4,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
+import { spawnSync } from 'node:child_process';
 import { loadTools, invoke, piDist } from './pi-harness.mjs';
 
 const cache = mkdtempSync(join(tmpdir(), 'pi-reddit-mock-'));
@@ -17,14 +19,22 @@ process.env.PI_REDDIT_STATUS_FOOTER = 'false';
 const originalFetch = globalThis.fetch;
 let respond;
 const requests = [];
+const realNow = Date.now;
+let clockFloor = 0;
+Date.now = () => Math.max(realNow(), clockFloor);
 globalThis.fetch = async (input, options) => {
   const url = new URL(input);
   requests.push(url);
   if (options.signal?.aborted) throw options.signal.reason;
   return respond(url, options);
 };
-after(() => { globalThis.fetch = originalFetch; rmSync(cache, { recursive: true, force: true }); });
+after(() => { Date.now = realNow; globalThis.fetch = originalFetch; db.close(); rmSync(cache, { recursive: true, force: true }); });
 const extension = await loadTools();
+const db = new DatabaseSync(process.env.PI_REDDIT_SQLITE_PATH);
+const requestRow = (url) => db.prepare('SELECT * FROM requests WHERE url = ?').get(String(url));
+const seedRequest = (url, data, expiresAt) => db.prepare(
+  'INSERT OR REPLACE INTO requests (url, status, saved_at, expires_at, raw_json) VALUES (?, 200, ?, ?, ?)'
+).run(String(url), Date.now(), expiresAt, JSON.stringify(data));
 const listing = (children, after) => ({ kind: 'Listing', data: { children, after: after ?? null } });
 const post = (id, subreddit = 'Alpha', score = 1, long = false) => ({ kind: 't3', data: {
   id, name: `t3_${id}`, subreddit, title: long ? 'large post '.repeat(120) : `source ${id}`,
@@ -63,19 +73,20 @@ test('Pi loader registers eight tools and all prepared arguments validate', asyn
 });
 
 test('reddit_user comments-only and default sections execute through the Pi agent loop', async () => {
-  respond = (url) => url.pathname.endsWith('about.json')
-    ? ok({ data: { name: 'testuser', id: 'abc', created_utc: 1700000000, link_karma: 5, subreddit: {} } })
-    : url.pathname.endsWith('comments.json') ? ok(listing([comment('comm01', 'yes'), comment('comm02')], 't1_comm02'))
+  respond = (url) => url.pathname.endsWith('/about')
+    ? ok({ kind: 't2', data: { name: 'testuser', id: 'abc', created_utc: 1700000000, link_karma: 5, subreddit: null } })
+    : url.pathname.endsWith('/comments') ? ok(listing([comment('comm01', 'yes'), comment('comm02')], 't1_comm02'))
       : ok(listing([post('abc123')], 't3_abc123'));
   const before = requests.length;
   const only = await call('reddit_user', { username: 'u/testuser', sections: 'comments', limit: 2 });
   assert.equal(only.details.posts.length, 0);
   assert.equal(only.details.about, undefined);
   assert.equal(only.details.comments.length, 2);
-  assert.deepEqual(requests.slice(before).map((url) => url.pathname), ['/user/testuser/comments.json']);
+  assert.deepEqual(requests.slice(before).map((url) => url.pathname), ['/user/testuser/comments']);
   assert.match(text(only), /after_comments=t1_comm02/);
   const defaults = await call('reddit_user', { username: 'testuser' });
   assert.equal(defaults.details.about.username, 'testuser');
+  assert.equal(defaults.details.about.profileVisible, false);
   assert.equal(defaults.details.posts.length, 1);
 });
 
@@ -171,8 +182,8 @@ test('multi-subreddit after is ignored and reported, including under truncation'
 
 test('user cursors are independent, wrong-prefix cursors are reported, partial failures survive', async () => {
   respond = (url) => {
-    if (url.pathname.endsWith('about.json')) return new Response('No such user', { status: 404 });
-    if (url.pathname.endsWith('comments.json')) return ok(listing([comment('part001')], 't1_part001'));
+    if (url.pathname.endsWith('/about')) return new Response('No such user', { status: 404 });
+    if (url.pathname.endsWith('/comments')) return ok(listing([comment('part001')], 't1_part001'));
     return ok(listing([post('part001')], 't3_part001'));
   };
   const before = requests.length;
@@ -183,8 +194,8 @@ test('user cursors are independent, wrong-prefix cursors are reported, partial f
   assert.equal(result.details.errors.length, 2);
   assert.match(text(result), /expected a t3_/);
   const calls = requests.slice(before);
-  assert.equal(calls.find((url) => url.pathname.endsWith('submitted.json')).searchParams.get('after'), null);
-  assert.equal(calls.find((url) => url.pathname.endsWith('comments.json')).searchParams.get('after'), 't1_valid');
+  assert.equal(calls.find((url) => url.pathname.endsWith('/submitted')).searchParams.get('after'), null);
+  assert.equal(calls.find((url) => url.pathname.endsWith('/comments')).searchParams.get('after'), 't1_valid');
 });
 
 test('malformed usernames fail before network access and bound echoed input', async () => {
@@ -243,6 +254,279 @@ test('reddit_user respects cancellation instead of fetching remaining sections',
   assert.equal(requests.length - before, 1);
 });
 
+test('all request families use api.reddit.com without changing public URLs', async () => {
+  respond = (url, options) => {
+    assert.equal(options.redirect, 'manual');
+    assert.equal(options.headers.cookie, 'synthetic-test-cookie');
+    assert.equal(url.searchParams.get('raw_json'), '1');
+    if (url.pathname.startsWith('/comments/')) return ok([listing([post('host001')]), listing([comment('hostcom')])]);
+    if (url.pathname.endsWith('/about')) return ok({ kind: 't2', data: { name: 'hostuser', subreddit: null } });
+    if (url.pathname.startsWith('/subreddits/')) return ok(listing([{ kind: 't5', data: { display_name: 'HostSub' } }]));
+    return ok(listing([post('host001')]));
+  };
+  const pathsFor = async (name, args) => {
+    const before = requests.length;
+    const result = await call(name, args);
+    if (result.details.posts) result.details.posts.forEach((p) => assert.equal(new URL(p.url).host, 'www.reddit.com'));
+    return requests.slice(before).map((u) => {
+      assert.equal(u.origin, 'https://api.reddit.com');
+      assert.ok(!u.pathname.endsWith('.json'));
+      return u.pathname;
+    });
+  };
+  assert.deepEqual(await pathsFor('reddit_search', { query: 'host-global' }), ['/search']);
+  assert.deepEqual(await pathsFor('reddit_search', { query: 'host-sub', subreddits: 'HostSub' }), ['/r/HostSub/search']);
+  assert.deepEqual(await pathsFor('reddit_trends', { subreddits: 'all', listing: 'hot' }), ['/r/all/hot']);
+  assert.deepEqual(await pathsFor('reddit_trends', { subreddits: 'HostSub', listing: 'hot' }), ['/r/HostSub/hot']);
+  assert.deepEqual(await pathsFor('reddit_user', { username: 'hostuser', sections: 'about,posts,comments' }),
+    ['/user/hostuser/about', '/user/hostuser/submitted', '/user/hostuser/comments']);
+  assert.deepEqual(await pathsFor('reddit_thread', { url_or_id: 'host001' }), ['/comments/host001']);
+  const thread = await call('reddit_thread', { url_or_id: 'host001' });
+  assert.equal(new URL(thread.details.comments[0].url).host, 'www.reddit.com');
+  assert.deepEqual(await pathsFor('reddit_subreddits', { query: 'host-subs' }), ['/subreddits/search']);
+  assert.deepEqual(await pathsFor('reddit_pack', { topic: 'host-pack', depth: 'quick' }), ['/search', '/comments/host001']);
+  assert.deepEqual(await pathsFor('reddit_resolve_subreddits', { topic: 'host-resolver', refresh: true }), ['/subreddits/search', '/search']);
+  const extracted = await call('reddit_url_extract', { url_or_id: 'https://old.reddit.com/r/Alpha/comments/host001/source/' });
+  assert.equal(new URL(extracted.details.canonical_url).host, 'www.reddit.com');
+});
+
+test('request normalization preserves encoded segments, query values, cursors and raw text', async () => {
+  const title = 'Read <b>A & B</b> &amp; C.json';
+  respond = () => { const item = post('rawtext'); item.data.title = title; return ok(listing([item])); };
+  const query = 'routing.json & raw_json=0 <tag>';
+  const result = await call('reddit_search', { query, subreddits: 'Route.json/Inner', sort: 'new', time: 'month', limit: 3, after: 't3_prev.json' });
+  const url = requests.at(-1);
+  assert.equal(url.pathname, '/r/Route.json%2FInner/search');
+  assert.equal(url.searchParams.get('q'), query);
+  assert.equal(url.searchParams.get('after'), 't3_prev.json');
+  assert.equal(url.searchParams.get('sort'), 'new');
+  assert.equal(url.searchParams.get('t'), 'month');
+  assert.equal(url.searchParams.get('limit'), '3');
+  assert.equal(url.searchParams.get('restrict_sr'), '1');
+  assert.deepEqual(url.searchParams.getAll('raw_json'), ['1']);
+  assert.deepEqual([...url.searchParams.keys()], ['after', 'limit', 'q', 'raw_json', 'restrict_sr', 'sort', 't']);
+  assert.equal(result.details.posts[0].title, title);
+});
+
+test('empty Listings and threads with no comments are valid and cached', async () => {
+  respond = (url) => ok(url.pathname.startsWith('/comments/') ? [listing([post('empty01')]), listing([])] : listing([]));
+  const empty = await call('reddit_search', { query: 'empty-listing' });
+  assert.deepEqual(empty.details.posts, []);
+  assert.ok(requestRow(requests.at(-1)).raw_json);
+  const user = await call('reddit_user', { username: 'emptyuser', sections: 'posts,comments' });
+  assert.deepEqual(user.details.errors, []);
+  const thread = await call('reddit_thread', { url_or_id: 'empty01' });
+  assert.deepEqual(thread.details.comments, []);
+});
+
+test('invalid successful responses never become cached/indexed empty successes', async () => {
+  const invalid = [
+    () => new Response('<html>secret-body</html>', { headers: { 'content-type': 'text/html' } }),
+    () => new Response('{ secret-body'),
+    () => ok({ error: 403, message: 'secret-body' }),
+    () => ok({ kind: 'Listing', data: {} }),
+    () => ok({ kind: 'Listing', data: { children: null } }),
+    () => ok(null),
+  ];
+  for (const [i, response] of invalid.entries()) {
+    respond = response;
+    const args = { query: `invalid-${i}-private-query` };
+    const result = await invoke(extension, 'reddit_search', args);
+    assert.equal(result.isError, true);
+    assert.match(text(result), /REDDIT_API_INVALID_RESPONSE: api\.reddit\.com\/search.*HTTP 200.*Listing/);
+    assert.doesNotMatch(text(result), /private-query|secret-body|synthetic-test-cookie|raw_json|\?/);
+    assert.equal(requestRow(requests.at(-1)), undefined);
+    const before = requests.length;
+    respond = () => ok(listing([]));
+    await call('reddit_search', args);
+    assert.equal(requests.length, before + 1, 'invalid responses must not poison cache');
+  }
+  for (const [i, payload] of [[], [listing([])], [listing([]), listing([])], [listing([post('noindex')]), {}]].entries()) {
+    respond = () => ok(payload);
+    const result = await invoke(extension, 'reddit_thread', { url_or_id: `badthr${i}` });
+    assert.equal(result.isError, true);
+    assert.match(text(result), /REDDIT_API_INVALID_RESPONSE.*thread/);
+    assert.equal(requestRow(requests.at(-1)), undefined);
+  }
+  assert.equal(db.prepare('SELECT id FROM posts WHERE id = ?').get('noindex'), undefined);
+  for (const [i, payload] of [{ data: { name: 'missingkind' } }, { kind: 't2', data: {} }, { kind: 't2', data: { name: 123 } }].entries()) {
+    respond = () => ok(payload);
+    const result = await call('reddit_user', { username: `baduser${i}`, sections: 'about' });
+    assert.equal(result.details.errors.length, 1);
+    assert.match(text(result), /fetch errors: about: REDDIT_API_INVALID_RESPONSE/);
+    assert.equal(requestRow(requests.at(-1)), undefined);
+  }
+});
+
+test('malformed cached payloads are ignored before fetch and on stale fallback', async () => {
+  const url = 'https://api.reddit.com/search?limit=8&q=bad-cache&raw_json=1&sort=relevance&t=year';
+  seedRequest(url, { kind: 'Listing', data: {} }, Date.now() + 60000);
+  const before = requests.length;
+  respond = () => ok(listing([post('cacheok')]));
+  await call('reddit_search', { query: 'bad-cache' });
+  assert.equal(requests.length, before + 1);
+  assert.deepEqual(JSON.parse(requestRow(url).raw_json), listing([post('cacheok')]));
+  seedRequest(url, { error: 'bad stale cache' }, Date.now() - 1);
+  respond = () => new Response('secret-body', { status: 503 });
+  const failed = await invoke(extension, 'reddit_search', { query: 'bad-cache' });
+  assert.equal(failed.isError, true);
+  assert.match(text(failed), /HTTP 503/);
+});
+
+test('endpoint errors bypass stale data and sanitize transport and redirect details', async () => {
+  const cases = [
+    ['REDDIT_API_REDIRECT', () => new Response(null, { status: 301, headers: { location: 'https://api.reddit.com/login?secret-target' } })],
+    ['REDDIT_API_REDIRECT', () => new Response(null, { status: 302, headers: { location: 'https://evil.invalid/?secret-target' } })],
+    ['REDDIT_API_ENDPOINT_GONE', () => new Response('secret-body', { status: 410 })],
+    ['REDDIT_API_UNAVAILABLE', () => { throw new TypeError('synthetic-test-cookie secret-network'); }],
+    ['REDDIT_API_INVALID_RESPONSE', () => ok({ error: 'secret-body' })],
+    ['REDDIT_API_INVALID_RESPONSE', () => new Response('secret-body')],
+  ];
+  for (const [i, [code, response]] of cases.entries()) {
+    const query = `stale-private-${i}`;
+    respond = () => ok(listing([post(`stale${i}`)]));
+    await call('reddit_search', { query });
+    const url = requests.at(-1);
+    db.prepare('UPDATE requests SET expires_at = 0 WHERE url = ?').run(String(url));
+    const before = requests.length;
+    respond = (_url, options) => { assert.equal(options.redirect, 'manual'); return response(); };
+    const result = await invoke(extension, 'reddit_search', { query });
+    assert.equal(result.isError, true, 'stale evidence must not conceal endpoint failures');
+    assert.match(text(result), new RegExp(code));
+    assert.doesNotMatch(text(result), /private|secret-|synthetic-test-cookie|evil\.invalid|\?/);
+    assert.equal(requests.length, before + 1, 'must not follow redirects or retry');
+    assert.equal(requestRow(url).expires_at, 0, 'failed response must not overwrite stale valid payload');
+  }
+});
+
+test('HTTP authentication, missing routes and server errors preserve status and stale fallback', async () => {
+  for (const status of [401, 404, 503]) {
+    respond = () => new Response('secret-body', { status });
+    const result = await invoke(extension, 'reddit_search', { query: `http-${status}` });
+    assert.equal(result.isError, true);
+    assert.equal(text(result), `Reddit JSON HTTP ${status}`);
+    assert.doesNotMatch(text(result), /REDDIT_API_|secret-body/);
+    const url = requests.at(-1);
+    seedRequest(url, listing([post(`http${status}`)]), Date.now() - 1);
+    const stale = await call('reddit_search', { query: `http-${status}` });
+    assert.equal(stale.details.posts[0].id, `http${status}`);
+  }
+});
+
+test('pack and user partial failures are visible even under output truncation', async () => {
+  respond = (url) => url.pathname.startsWith('/comments/') || url.pathname.endsWith('/about')
+    ? ok({ error: 'changed' }) : ok(listing([post('partialpack', 'Alpha', 1, true)]));
+  const pack = await call('reddit_pack', { topic: 'partial-pack-errors', depth: 'quick' });
+  assert.equal(pack.details.posts.length, 1);
+  assert.equal(pack.details.commented_post_count, 0);
+  assert.match(pack.details.errors[0], /REDDIT_API_INVALID_RESPONSE/);
+  assert.match(text(pack), /fetch errors: thread partialpack: REDDIT_API_INVALID_RESPONSE/);
+  const user = await call('reddit_user', { username: 'contractuser', sections: 'about,posts' });
+  assert.equal(user.details.posts.length, 1);
+  assert.match(text(user), /fetch errors: about: REDDIT_API_INVALID_RESPONSE/);
+  respond = () => ok({ error: 'changed' });
+  const resolver = await invoke(extension, 'reddit_resolve_subreddits', { topic: 'contract-resolver', refresh: true });
+  assert.equal(resolver.isError, true);
+  assert.match(text(resolver), /REDDIT_API_INVALID_RESPONSE/);
+});
+
+test('cancellation before cache, during body parsing and in pack threads is preserved', async () => {
+  const execute = (name, args, signal) => {
+    const tool = extension.tools.get(name).definition;
+    return tool.execute('abort-test', tool.prepareArguments(args), signal);
+  };
+  const pre = new AbortController();
+  pre.abort(new Error('cancel-before-fetch'));
+  const before = requests.length;
+  await assert.rejects(() => execute('reddit_search', { query: 'cache-pagination', subreddits: 'PageSub', limit: 1 }, pre.signal), /cancel-before-fetch/);
+  assert.equal(requests.length, before);
+  const body = new AbortController();
+  respond = () => ({ status: 200, ok: true, json: async () => { body.abort(new Error('cancel-body')); throw body.signal.reason; } });
+  await assert.rejects(() => execute('reddit_search', { query: 'abort-body' }, body.signal), /cancel-body/);
+  const pack = new AbortController();
+  respond = (url) => {
+    if (url.pathname.startsWith('/comments/')) { pack.abort(new Error('cancel-pack')); throw pack.signal.reason; }
+    return ok(listing([post('abortpack')]));
+  };
+  await assert.rejects(() => execute('reddit_pack', { topic: 'abort-pack', depth: 'quick' }, pack.signal), /cancel-pack/);
+  respond = () => { throw new DOMException('cancel-fetch', 'AbortError'); };
+  await assert.rejects(() => execute('reddit_search', { query: 'abort-without-signal' }), /cancel-fetch/);
+});
+
+test('multiple long thread errors cannot push the visible error summary out of the output budget', async () => {
+  respond = (url) => url.pathname.startsWith('/comments/')
+    ? new Response(null, { status: 410 })
+    : ok(listing(Array.from({ length: 12 }, (_, i) => post(`manyerrors${i}`, 'Alpha', i, true)), 't3_next'));
+  const result = await call('reddit_pack', { topic: 'many-thread-failures', depth: 'deep' });
+  assert.ok(result.details.errors.join('; ').length > 1000);
+  assert.match(text(result), /fetch errors:.*REDDIT_API_ENDPOINT_GONE/);
+  assert.match(text(result), /after=t3_next/);
+});
+
+test('live smoke stops on observed HTTP 429 and restores fetch (synthetic HTTP)', () => {
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    let requests = 0;
+    const fakeFetch = globalThis.fetch = async () => {
+      requests++;
+      return new Response(null, { status: 429 });
+    };
+    await import('./scripts/smoke-live.mjs');
+    assert.equal(requests, 1);
+    assert.equal(globalThis.fetch, fakeFetch);
+    assert.equal(process.exitCode, 1);
+    process.exitCode = 0;
+  `], { cwd: process.cwd(), encoding: 'utf8', timeout: 30000 });
+  assert.equal(child.status, 0, child.stderr || child.error?.message);
+  assert.match(child.stderr, /HTTP 429: validation blocked/);
+  assert.doesNotMatch(child.stdout, /Live Reddit smoke checks passed/);
+});
+
+// Last: virtual time isolates module-global cooldown without a production reset API.
+// Every post-cooldown case asserts that it actually reaches fetch.
+test('403/429 cooldowns respect Retry-After, allow valid stale data and reject invalid stale data', async (t) => {
+  let now = Date.now() + 1000;
+  t.after(() => { clockFloor = now; });
+  t.mock.method(Date, 'now', () => now);
+  for (const status of [403, 429]) {
+    const query = `cooldown-${status}`;
+    respond = () => new Response('secret-body', { status, headers: { 'retry-after': '2' } });
+    const before = requests.length;
+    const result = await invoke(extension, 'reddit_search', { query });
+    assert.equal(requests.length, before + 1);
+    assert.equal(result.isError, true);
+    assert.match(text(result), new RegExp(`HTTP ${status}; cooldown started`));
+    assert.doesNotMatch(text(result), /REDDIT_API_|secret-body/);
+    const url = requests.at(-1);
+    now += 1000;
+    seedRequest(url, listing([post(`stale${status}`)]), now - 1);
+    const stale = await call('reddit_search', { query });
+    assert.equal(stale.details.posts[0].id, `stale${status}`);
+    assert.equal(requests.length, before + 1, 'cooldown stale hit must not fetch');
+    seedRequest(url, { error: 'invalid cached payload' }, now - 1);
+    const blocked = await invoke(extension, 'reddit_search', { query });
+    assert.equal(blocked.isError, true);
+    assert.match(text(blocked), /cooling down for 1s/);
+    now += 1001;
+    respond = () => new Response('secret-body', { status, headers: { 'retry-after': '2' } });
+    seedRequest(url, listing([post(`stale${status}`)]), now - 1);
+    const fallback = await call('reddit_search', { query });
+    assert.equal(fallback.details.posts[0].id, `stale${status}`);
+    assert.equal(requests.length, before + 2, 'expired cooldown must fetch, then allow stale fallback');
+    now += 2001;
+  }
+  respond = () => new Response(null, { status: 429 });
+  const before = requests.length;
+  await invoke(extension, 'reddit_search', { query: 'default-cooldown' });
+  const blocked = await invoke(extension, 'reddit_search', { query: 'after-default-cooldown' });
+  assert.match(text(blocked), /cooling down for 300s/);
+  assert.equal(requests.length, before + 1);
+  now += 300001;
+  respond = () => ok(listing([]));
+  await call('reddit_search', { query: 'after-default-cooldown' });
+  assert.equal(requests.length, before + 2);
+});
+
 for (const mode of ['rising', 'controversial']) {
   test(`${mode} defaults to Reddit order and only controversial sends the time window`, async () => {
     respond = () => ok(listing([post('native1', mode, 0), post('native2', mode, 100000)], 't3_native2'));
@@ -252,7 +536,7 @@ for (const mode of ['rising', 'controversial']) {
     assert.equal(result.details.order, 'reddit');
     assert.equal(result.details.cursors.after, 't3_native2');
     const [url] = requests.slice(before);
-    assert.equal(url.pathname, `/r/Native${mode}/${mode}.json`);
+    assert.equal(url.pathname, `/r/Native${mode}/${mode}`);
     assert.equal(url.searchParams.get('t'), mode === 'controversial' ? 'month' : null);
     const ranked = await call('reddit_trends', { subreddits: `Native${mode}`, listing: mode, time: 'month', limit: 2, order: 'ranked' });
     assert.deepEqual(ranked.details.posts.map((p) => p.id), ['native2', 'native1']);
@@ -309,7 +593,7 @@ for (const sub of ['all', 'popular']) {
     const second = await call('reddit_trends', { ...args, after: first.details.cursors.after });
     assert.deepEqual(first.details.posts.map((p) => p.id), ['feed001']);
     assert.deepEqual(second.details.posts.map((p) => p.id), ['feed002']);
-    assert.ok(requests.slice(before).every((url) => url.pathname === `/r/${sub}/hot.json`));
+    assert.ok(requests.slice(before).every((url) => url.pathname === `/r/${sub}/hot`));
     assert.equal(requests[before + 1].searchParams.get('after'), 't3_feed001');
   });
 }
@@ -325,9 +609,17 @@ test('trends preparation normalizes listing/order and defaults invalid values sa
 const more = (children, parent = 't3_abc123', depth = 0, count = children.length) => ({ kind: 'more', data: {
   id: children.length ? children[0] : '_', parent_id: parent, depth, count, children,
 } });
-const threadPayload = (id, children, long = false) => [listing([post(id, 'Alpha', 1, long)]), listing(children)];
-const morePayload = (things) => ({ json: { errors: [], data: { things } } });
-const expansionRequests = (before) => requests.slice(before).filter((url) => url.pathname === '/api/morechildren.json');
+let expansionPostId;
+const expansionParents = (things) => things.map((thing) => {
+  if (thing?.data?.parent_id === 't3_abc123') thing.data.parent_id = `t3_${expansionPostId}`;
+  return thing;
+});
+const threadPayload = (id, children, long = false) => {
+  expansionPostId = id;
+  return [listing([post(id, 'Alpha', 1, long)]), listing(expansionParents(children))];
+};
+const morePayload = (things) => ({ json: { errors: [], data: { things: expansionParents(things) } } });
+const expansionRequests = (before) => requests.slice(before).filter((url) => url.pathname === '/api/morechildren');
 
 test('reddit_thread fetch cap is 500, default remains 50, and expansion is opt-in', async () => {
   respond = (url) => ok(threadPayload(url.pathname.split('/')[2].replace('.json', ''), [comment('cap001'), more(['cap002'])]));
@@ -366,7 +658,7 @@ test('collapsed branches, nested deleted parents and continue-thread stubs are r
 
 test('expansion chunks at 100 and spends at most its actual HTTP budget', async () => {
   const ids = Array.from({ length: 250 }, (_, i) => `wide${String(i).padStart(3, '0')}`);
-  respond = (url) => url.pathname === '/api/morechildren.json'
+  respond = (url) => url.pathname === '/api/morechildren'
     ? ok(morePayload(url.searchParams.get('children').split(',').map((id) => comment(id))))
     : ok(threadPayload('wide001', [comment('start01'), more(ids, 't3_wide001')]));
   const before = requests.length;
@@ -394,7 +686,7 @@ test('expansion chunks at 100 and spends at most its actual HTTP budget', async 
 test('expand_more cannot exceed five HTTP requests even when every response reveals another branch', async () => {
   let step = 0;
   respond = (url) => {
-    if (url.pathname !== '/api/morechildren.json') return ok(threadPayload('budget5', [more(['step000'])]));
+    if (url.pathname !== '/api/morechildren') return ok(threadPayload('budget5', [more(['step000'])]));
     const id = `step${String(step++).padStart(3, '0')}`;
     return ok(morePayload([comment(id), more([`step${String(step).padStart(3, '0')}`])]));
   };
@@ -413,7 +705,7 @@ test('expansion follows nested more, deduplicates overlap/descendants, preserves
       const parent = comment('childb'); Object.assign(parent.data, { parent_id: 't1_childa', depth: 0 });
       return ok(threadPayload('nested1', [parent]));
     }
-    if (url.pathname !== '/api/morechildren.json') return ok(threadPayload('nested1', [comment('root001'), more(['childa', 'gone01']), more([], 't1_childb', 3)]));
+    if (url.pathname !== '/api/morechildren') return ok(threadPayload('nested1', [comment('root001'), more(['childa', 'gone01']), more([], 't1_childb', 3)]));
     if (batch++ === 0) {
       const a = comment('childa'); Object.assign(a.data, { parent_id: 't1_root001', depth: 1, score: 10 });
       const b = comment('childb'); Object.assign(b.data, { parent_id: 't1_childa', depth: 2, score: 9 });
@@ -440,7 +732,7 @@ test('expansion follows nested more, deduplicates overlap/descendants, preserves
 });
 
 test('expansion prioritizes shallow branches, then larger branches, and keeps sort mapping', async () => {
-  respond = (url) => url.pathname === '/api/morechildren.json' ? ok(morePayload([])) : ok(threadPayload('prior01', [
+  respond = (url) => url.pathname === '/api/morechildren' ? ok(morePayload([])) : ok(threadPayload('prior01', [
     more(['deep001'], 't1_deep', 3, 100), more(['small01'], 't3_prior01', 0, 1), more(['large01'], 't3_prior01', 0, 9),
   ]));
   const before = requests.length;
@@ -456,7 +748,7 @@ test('expansion prioritizes shallow branches, then larger branches, and keeps so
 
 test('cached expansions spend no HTTP budget and can continue to the next uncached batch', async () => {
   const ids = Array.from({ length: 150 }, (_, i) => `cache${String(i).padStart(3, '0')}`);
-  respond = (url) => url.pathname === '/api/morechildren.json'
+  respond = (url) => url.pathname === '/api/morechildren'
     ? ok(morePayload(url.searchParams.get('children').split(',').map((id) => comment(id))))
     : ok(threadPayload('cache01', [more(ids)]));
   const first = await call('reddit_thread', { url_or_id: 'cache01', expand_more: 1 });
@@ -478,7 +770,7 @@ for (const kind of ['network', 'http', 'json-errors', 'malformed', 'invalid-json
     const id = `fail${['network', 'http', 'json-errors', 'malformed', 'invalid-json', 'invalid-node'].indexOf(kind)}00`;
     let batch = 0;
     respond = (url) => {
-      if (url.pathname !== '/api/morechildren.json') return ok(threadPayload(id, [comment('before1'), more(['first01'])]));
+      if (url.pathname !== '/api/morechildren') return ok(threadPayload(id, [comment('before1'), more(['first01'])]));
       if (batch++ === 0) return ok(morePayload([comment('first01'), more(['second1'])]));
       if (kind === 'network') throw new Error('Synthetic network failure.');
       if (kind === 'http') return new Response('Synthetic server failure.', { status: 503 });
@@ -519,7 +811,7 @@ test('empty continuation is attempted once and stays unresolved; fully loaded th
 });
 
 test('malformed child batches cannot overwrite indexed ownership before rejection', async () => {
-  respond = (url) => url.pathname === '/api/morechildren.json'
+  respond = (url) => url.pathname === '/api/morechildren'
     ? ok(threadPayload('wrongidx', [comment('indexpar'), comment('foreignxx')]))
     : ok(threadPayload('indexok', [comment('indexpar'), more(['indexkid'])]));
   const result = await call('reddit_thread', { url_or_id: 'indexok', expand_more: 1 });
@@ -535,10 +827,40 @@ test('malformed child batches cannot overwrite indexed ownership before rejectio
   } finally { db.close(); }
 });
 
+for (const mismatch of ['post', 'parent', 'branch', 'nested']) {
+  test(`expansion rejects ${mismatch} ownership mismatches before changing evidence`, async () => {
+    const source = `own${mismatch}`;
+    const foreign = comment('foreignown');
+    Object.assign(foreign.data, { parent_id: 't3_otherown', link_id: 't3_otherown' });
+    respond = () => ok(threadPayload('otherown', [foreign]));
+    await call('reddit_thread', { url_or_id: 'otherown' });
+    respond = (url) => {
+      if (url.pathname !== '/api/morechildren') return ok(threadPayload(source, [comment('ownedroot'), more(['wantedown'])]));
+      const good = comment('wantedown'); good.data.parent_id = `t3_${source}`;
+      const bad = structuredClone(foreign);
+      if (mismatch === 'post') bad.data.parent_id = `t3_${source}`;
+      if (mismatch === 'parent') delete bad.data.link_id;
+      if (mismatch === 'branch') { delete bad.data.link_id; bad.data.parent_id = 't1_unrelated'; }
+      if (mismatch === 'nested') { good.data.replies = listing([bad]); return ok(morePayload([good])); }
+      return ok(morePayload([good, bad]));
+    };
+    const result = await call('reddit_thread', { url_or_id: source, expand_more: 1 });
+    assert.match(result.details.expansion_stopped, /another post|unrelated branch/);
+    assert.equal(result.details.expansion.comments_added, 0);
+    assert.deepEqual(result.details.comments.map((c) => c.id), ['ownedroot']);
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(join(cache, 'reddit.sqlite'));
+    try {
+      assert.equal(db.prepare('SELECT post_id FROM comments WHERE id = ?').get('foreignown').post_id, 'otherown');
+      assert.equal(db.prepare('SELECT id FROM comments WHERE id = ?').get('wantedown'), undefined);
+    } finally { db.close(); }
+  });
+}
+
 test('cancelling expansion keeps the fetched thread and does not fetch another batch', async () => {
   const controller = new AbortController();
   respond = (url) => {
-    assert.notEqual(url.pathname, '/api/morechildren.json');
+    assert.notEqual(url.pathname, '/api/morechildren');
     controller.abort(new Error('Synthetic cancellation.'));
     return ok(threadPayload('cancel1', [comment('kept001'), more(['hidden2'])]));
   };
@@ -588,7 +910,7 @@ for (const [index, mode] of ['relative', 'absolute', 'omitted', 'parent-omitted'
     assert.deepEqual(result.details.expansion.pending_ids, [tail]);
     assert.equal(result.details.expansion.requests, 1);
     const [url] = continuationRequests(before);
-    assert.equal(url.pathname, `/comments/${id}/_/${parent}.json`);
+    assert.equal(url.pathname, `/comments/${id}/_/${parent}`);
     assert.equal(url.searchParams.get('limit'), '200');
     assert.equal(url.searchParams.get('sort'), 'top');
     assert.equal(url.searchParams.get('raw_json'), '1');
@@ -688,7 +1010,7 @@ for (const [index, replies] of [undefined, '', listing([])].entries()) {
 test('ordinary ids always outrank continuation stubs, including newly revealed ids', async () => {
   let batch = 0;
   respond = (url) => {
-    if (url.pathname === '/api/morechildren.json') return ok(morePayload(batch++ === 0
+    if (url.pathname === '/api/morechildren') return ok(morePayload(batch++ === 0
       ? [comment('prioid1'), more(['prioid2'], 't1_prioid1', 10)] : [comment('prioid2')]));
     if (url.pathname.includes('/_/')) {
       const root = deepComment('priopar', 't3_priocnt', 0);
@@ -699,7 +1021,7 @@ test('ordinary ids always outrank continuation stubs, including newly revealed i
   };
   const before = requests.length;
   const result = await call('reddit_thread', { url_or_id: 'priocnt', expand_more: 3 });
-  assert.deepEqual(requests.slice(before + 1).map((url) => url.pathname), ['/api/morechildren.json', '/api/morechildren.json', '/comments/priocnt/_/priopar.json']);
+  assert.deepEqual(requests.slice(before + 1).map((url) => url.pathname), ['/api/morechildren', '/api/morechildren', '/comments/priocnt/_/priopar']);
   assert.equal(result.details.expansion.requests, 3);
   assert.equal(result.details.expansion.stubs_resolved, 1);
 });
@@ -707,7 +1029,7 @@ test('ordinary ids always outrank continuation stubs, including newly revealed i
 test('continuation chains share the five-request cap and leave remaining stubs visible', async () => {
   respond = (url) => {
     if (!url.pathname.includes('/_/')) return ok(threadPayload('chainc1', [more([], 't1_chnp0', 1)]));
-    const index = Number(url.pathname.match(/chnp(\d+)\.json$/)[1]);
+    const index = Number(url.pathname.match(/chnp(\d+)$/)[1]);
     const root = deepComment(`chnp${index}`, 't3_chainc1', 0);
     const child = deepComment(`chnp${index + 1}`, `t1_chnp${index}`, 1);
     child.data.replies = listing([more([], `t1_chnp${index + 1}`, 2)]);
@@ -726,7 +1048,7 @@ test('continuation chains share the five-request cap and leave remaining stubs v
 
 test('cached continuations cost no HTTP budget and can lead to an uncached child batch', async () => {
   respond = (url) => {
-    if (url.pathname === '/api/morechildren.json') return ok(morePayload([deepComment('cachecx', 't1_cacheck', 7)]));
+    if (url.pathname === '/api/morechildren') return ok(morePayload([deepComment('cachecx', 't1_cacheck', 7)]));
     if (!url.pathname.includes('/_/')) return ok(threadPayload('cachect', [deepComment('cachecp', 't1_above00', 5), more([], 't1_cachecp', 6)]));
     const root = deepComment('cachecp', 't1_above00', 0);
     const child = deepComment('cacheck', 't1_cachecp', 1);
@@ -770,7 +1092,7 @@ for (const [index, kind] of ['network', 'http', 'wrong-post', 'wrong-branch', 'e
   test(`continuation ${kind} failure preserves prior expansion and reports unresolved stubs under truncation`, async () => {
     const id = `ctfail${index}`;
     respond = (url) => {
-      if (url.pathname === '/api/morechildren.json') return ok(morePayload([comment('priorok')]));
+      if (url.pathname === '/api/morechildren') return ok(morePayload([comment('priorok')]));
       if (!url.pathname.includes('/_/')) return ok(threadPayload(id, [deepComment('failpar', 't1_above00', 5), more(['priorok']), more([], 't1_failpar', 6)], true));
       if (kind === 'network') throw new Error('Synthetic continuation network failure.');
       if (kind === 'http') return new Response('Synthetic continuation unavailable.', { status: 503 });
@@ -825,7 +1147,7 @@ test('cancellation during a continuation counts its HTTP attempt and retains the
 for (const [index, sort] of ['old', 'qa'].entries()) {
   test(`${sort} is accepted consistently by thread, child batches and continuation requests`, async () => {
     const id = `sortct${index}`;
-    respond = (url) => url.pathname === '/api/morechildren.json' ? ok(morePayload([comment('sortkid')]))
+    respond = (url) => url.pathname === '/api/morechildren' ? ok(morePayload([comment('sortkid')]))
       : ok(threadPayload(id, url.pathname.includes('/_/') ? [deepComment('sortpar', `t3_${id}`, 0)] : [comment('sortpar'), more(['sortkid']), more([], 't1_sortpar', 1)]));
     const before = requests.length;
     const result = await call('reddit_thread', { url_or_id: id, sort: ` ${sort.toUpperCase()} `, expand_more: 2 });
@@ -844,10 +1166,213 @@ test('new comment sorts retain the top default and do not broaden post-search so
   assert.equal(extension.tools.get('reddit_search').definition.prepareArguments({ sort: 'old' }).sort, 'relevance');
 });
 
+for (const [name, fallback] of [['reddit_search', 8], ['reddit_trends', 10]]) {
+  test(`${name} keeps default limits, caps at 100 and normalizes output format`, async () => {
+    const tool = extension.tools.get(name).definition;
+    assert.equal(tool.prepareArguments({}).limit, fallback);
+    assert.equal(tool.prepareArguments({}).format, 'full');
+    assert.equal(tool.prepareArguments({ limit: 101, format: ' COMPACT ' }).limit, 100);
+    assert.equal(tool.prepareArguments({ format: ' COMPACT ' }).format, 'compact');
+    assert.equal(tool.prepareArguments({ limit: 0, format: 'invalid' }).limit, 1);
+    assert.equal(tool.prepareArguments({ format: 'invalid' }).format, 'full');
+    respond = (url) => ok(listing(Array.from({ length: Number(url.searchParams.get('limit')) }, (_, i) => post(`wide${i}`, 'Wide')), 't3_wide99'));
+    const before = requests.length;
+    const result = await call(name, { query: `volume-${name}`, subreddits: `Volume${fallback}`, limit: 100, format: 'full' });
+    const compact = await call(name, { query: `volume-${name}`, subreddits: `Volume${fallback}`, limit: 100, format: 'compact' });
+    assert.equal(requests[before].searchParams.get('limit'), '100');
+    assert.equal(requests.length - before, 1, 'format changes reuse the same request cache');
+    assert.equal(result.details.posts.length, 100);
+    assert.equal(compact.details.posts.length, 100);
+    assert.deepEqual(compact.details.posts, result.details.posts);
+    assert.deepEqual(compact.details.cursors, result.details.cursors);
+    assert.equal(result.details.format, 'full');
+    assert.equal(compact.details.format, 'compact');
+    assert.ok(compact.details.posts_shown > result.details.posts_shown);
+    assert.match(text(result), /showing \d+ of 100; use format=compact or lower limit before paginating/);
+    assert.match(text(compact), /Full results remain in details.posts/);
+    assert.match(text(compact), /after=t3_wide99/);
+  });
+
+  for (const format of ['full', 'compact']) {
+    test(`${name} ${format} truncates only between complete entries`, async () => {
+      respond = () => ok(listing(Array.from({ length: 30 }, (_, i) => post(`whole${i}`, 'Whole')), 't3_whole29'));
+      const result = await call(name, { query: `whole-${name}-${format}`, subreddits: `Whole${name}${format}`, limit: 30, format });
+      const evidence = text(result).split('\n\n[truncated:')[0];
+      const entries = evidence.split(/\n(?=\d+\. r\/)/).slice(1);
+      assert.equal(entries.length, result.details.posts_shown);
+      assert.ok(entries.length > 0 && entries.length < 30);
+      assert.equal(result.details.posts.length, 30);
+      for (const entry of entries) {
+        if (format === 'full') {
+          assert.equal(entry.split('\n').length, 4);
+          assert.match(entry.split('\n').at(-1), /^   post excerpt: /);
+        } else {
+          assert.equal(entry.split('\n').length, 1);
+          assert.match(entry, /score \d+, comments 4, age .+ \| source whole\d+ \| https:\/\/www\.reddit\.com\//);
+        }
+      }
+      assert.doesNotMatch(text(result), /truncated to 2000/);
+      assert.match(text(result), /after=t3_whole29/);
+    });
+  }
+
+  test(`${name} reports zero displayed entries for an oversized full post without hiding structured data`, async () => {
+    const child = post('oversize', 'Oversize');
+    child.data.title = 'very large title '.repeat(1000);
+    respond = () => ok(listing([child], 't3_oversize'));
+    const args = { query: `oversize-${name}`, subreddits: `Oversize${name}`, limit: 1 };
+    const full = await call(name, args);
+    assert.equal(full.details.posts_shown, 0);
+    assert.equal(full.details.posts.length, 1);
+    assert.match(text(full), /showing 0 of 1/);
+    assert.doesNotMatch(text(full), /^1\. r\//m);
+    const compact = await call(name, { ...args, format: 'compact' });
+    assert.equal(compact.details.posts_shown, 1);
+    assert.deepEqual(compact.details.posts, full.details.posts);
+  });
+
+  test(`${name} paginates 100-result compact pages without overlapping ids`, async () => {
+    respond = (url) => {
+      const start = url.searchParams.has('after') ? 100 : 0;
+      return ok(listing(Array.from({ length: 100 }, (_, i) => post(`bulk${start + i}`, 'Bulk')), start === 0 ? 't3_bulk99' : undefined));
+    };
+    const args = { query: `bulk-pages-${name}`, subreddits: `Bulk${name}`, limit: 100, format: 'compact' };
+    const before = requests.length;
+    const first = await call(name, args);
+    const second = await call(name, { ...args, after: first.details.cursors.after });
+    assert.equal(first.details.posts.length, 100);
+    assert.equal(second.details.posts.length, 100);
+    assert.equal(first.details.cursors.after, 't3_bulk99');
+    assert.equal(second.details.cursors.after, undefined);
+    const seen = new Set(first.details.posts.map((post) => post.id));
+    assert.ok(second.details.posts.every((post) => !seen.has(post.id)));
+    assert.equal(requests.length - before, 2);
+    assert.equal(requests[before + 1].searchParams.get('after'), 't3_bulk99');
+  });
+
+  test(`${name} handles empty compact results and preserves default full output`, async () => {
+    respond = () => ok(listing([]));
+    const empty = await call(name, { query: `empty-format-${name}`, subreddits: `EmptyFormat${name}`, format: 'compact' });
+    assert.equal(empty.details.posts_shown, 0);
+    assert.deepEqual(empty.details.posts, []);
+    assert.match(text(empty), /No Reddit posts found/);
+    respond = () => ok(listing([post('legacyformat')]));
+    const before = requests.length;
+    const full = await call(name, { query: `legacy-format-${name}`, subreddits: `LegacyFormat${name}` });
+    assert.equal(requests[before].searchParams.get('limit'), String(fallback));
+    assert.equal(full.details.format, 'full');
+    assert.match(text(full), /by u\/testuser/);
+    assert.match(text(full), /post excerpt: body evidence/);
+  });
+}
+
+for (const order of ['reddit', 'ranked']) {
+  test(`trends ${order} deduplicates ids before applying the result cap and keeps safe cursors`, async () => {
+    respond = (url) => {
+      const first = url.pathname.includes('/DupA/');
+      return ok(listing(first ? [post('sharedid', 'Actual', 1), post('uniquea', 'Actual', 10), post('uniquea', 'Actual', 10)]
+        : [post('sharedid', 'Actual', 1), post('uniqueb', 'Actual', 9)], first ? 't3_uniquea' : 't3_uniqueb'));
+    };
+    const result = await call('reddit_trends', { subreddits: 'DupA,DupB', listing: 'hot', order, limit: 3, format: 'compact' });
+    assert.equal(result.details.posts.length, 3);
+    assert.deepEqual(result.details.posts.map((p) => p.id), order === 'reddit' ? ['sharedid', 'uniquea', 'uniqueb'] : ['uniquea', 'uniqueb', 'sharedid']);
+    assert.equal(result.details.cursors.per_subreddit.DupA.after, 't3_uniquea');
+    assert.equal(result.details.cursors.per_subreddit.DupB.after, 't3_uniqueb');
+  });
+}
+
+test('compact multi-subreddit searches retain unreturned-prefix cursors and formatting does not change them', async () => {
+  respond = (url) => ok(listing(url.pathname.includes('/FormatA/')
+    ? [post('fmta1', 'FormatA', 100000), post('fmta2', 'FormatA', 99999)]
+    : [post('fmtb1', 'FormatB', 0), post('fmtb2', 'FormatB', 99998)], 't3_pageend'));
+  const args = { query: 'format-safe-multi', subreddits: 'FormatA,FormatB', limit: 1, after: 't3_ignored' };
+  const full = await call('reddit_search', args);
+  const compact = await call('reddit_search', { ...args, format: 'compact' });
+  assert.deepEqual(compact.details.cursors, full.details.cursors);
+  assert.equal(compact.details.cursors.per_subreddit.FormatA.after, 't3_fmta1');
+  assert.equal(compact.details.cursors.per_subreddit.FormatB.restart, true);
+  assert.match(text(compact), /after was ignored/);
+});
+
+test('post context preserves Reddit permalinks and only valid non-reddit.com destinations', async () => {
+  const cases = [
+    ['external', { url: 'https://example.com/article?q=1', stickied: true, is_video: true }, 'https://example.com/article?q=1'],
+    ['selfpost', { is_self: true, url: 'https://example.com/not-a-destination' }],
+    ['redditroot', { url: 'https://reddit.com/comments/abc' }],
+    ['redditsub', { url: 'https://old.reddit.com/comments/abc' }],
+    ['redditdot', { url: 'https://REDDIT.COM./comments/abc' }],
+    ['lookalike', { url: 'https://reddit.com.example.org/article' }, 'https://reddit.com.example.org/article'],
+    ['cdnlink', { url: 'https://i.redd.it/example.png' }, 'https://i.redd.it/example.png'],
+    ['invalid', { url: 'not an absolute URL' }],
+    ['relative', { url: '/relative/path' }],
+    ['scripturl', { url: 'javascript:alert(1)' }],
+    ['userinfo', { url: 'https://user:example@example.com/article' }],
+    ['missing', {}],
+    ['malformedflags', { is_self: 'false', stickied: 'true', is_video: 1 }],
+  ];
+  respond = () => ok(listing(cases.map(([id, fields]) => {
+    const child = post(id, 'Context');
+    Object.assign(child.data, fields);
+    return child;
+  })));
+  const result = await call('reddit_search', { query: 'post-context', limit: 25, format: 'compact' });
+  for (const [id, fields, destination] of cases) {
+    const parsed = result.details.posts.find((p) => p.id === id);
+    assert.equal(parsed.externalUrl, destination, id);
+    assert.equal(parsed.url, `https://www.reddit.com/r/Context/comments/${id}/source/`, id);
+    assert.equal(parsed.permalink, `/r/Context/comments/${id}/source/`, id);
+    assert.equal(parsed.isSelf, fields.is_self === true, id);
+    assert.equal(parsed.stickied, fields.stickied === true, id);
+    assert.equal(parsed.isVideo, fields.is_video === true, id);
+  }
+  assert.match(text(result), /\[sticky\]/);
+  assert.match(text(result), /destination https:\/\/example.com\/article\?q=1/);
+});
+
+test('external destinations and sticky markers render in full, compact, thread and user output', async () => {
+  const child = post('linkrender', 'LinkRender');
+  Object.assign(child.data, { url: 'https://example.org/guide', is_self: false, stickied: true, is_video: true, title: 'Guide\nwith\tspacing' });
+  respond = (url) => ok(url.pathname.startsWith('/comments/') ? [listing([child]), listing([])] : listing([child]));
+  const full = await call('reddit_search', { query: 'link-rendering' });
+  const compact = await call('reddit_search', { query: 'link-rendering', format: 'compact' });
+  const thread = await call('reddit_thread', { url_or_id: 'linkrender' });
+  const user = await call('reddit_user', { username: 'linkauthor', sections: 'posts' });
+  for (const result of [full, compact, thread, user]) {
+    assert.match(text(result), /\[sticky\]/);
+    assert.match(text(result), /destination[: ]+https:\/\/example.org\/guide/);
+    assert.match(text(result), /https:\/\/www.reddit.com\/r\/LinkRender\/comments\/linkrender\/source\//);
+  }
+  assert.match(text(compact), /Guide with spacing/);
+  assert.equal(text(compact).split('\n').filter((line) => /^\d+\. r\//.test(line)).length, 1);
+  const { initTheme } = await import(pathToFileURL(join(piDist, 'modes/interactive/theme/theme.js')));
+  const { ToolExecutionComponent } = await import(pathToFileURL(join(piDist, 'modes/interactive/components/tool-execution.js')));
+  initTheme('dark', false);
+  for (const result of [full, compact]) {
+    const component = new ToolExecutionComponent('reddit_search', 'link-render', { query: 'link-rendering', format: result.details.format }, {},
+      extension.tools.get('reddit_search').definition, { requestRender() {} }, process.cwd());
+    component.updateResult(result);
+    assert.ok(component.render(100).length > 0);
+    component.setExpanded(true);
+    assert.ok(component.render(100).length > 0);
+  }
+});
+
+test('oversized compact destinations never produce partial entries or exceed the output budget', async () => {
+  const child = post('hugeurl', 'HugeUrl');
+  child.data.url = `https://example.com/${'x'.repeat(5000)}`;
+  respond = () => ok(listing([child]));
+  const result = await call('reddit_search', { query: 'oversized-destination', format: 'compact' });
+  assert.equal(result.details.posts_shown, 0);
+  assert.equal(result.details.posts[0].externalUrl.length > 5000, true);
+  assert.match(text(result), /showing 0 of 1/);
+  assert.doesNotMatch(text(result), /^1\. r\//m);
+});
+
 test('403 resource denials do not block unrelated uncached requests; block/rate-limit behavior is preserved', async (t) => {
   // All requests below are synthetic. A controlled clock expires each case's cooldown
   // without waiting five real minutes or letting one case contaminate the next.
   let now = Date.now() + 600000;
+  t.after(() => { clockFloor = now; });
   t.mock.method(Date, 'now', () => now);
   let caseId = 0;
   const runCase = async (name, status, body, headers = {}, denial = false, refresh = false) => {
@@ -900,7 +1425,7 @@ test('403 resource denials do not block unrelated uncached requests; block/rate-
   respond = (url) => {
     now += 251;
     if (url.searchParams.get('q') === 'expansion-rate-limit') return new Response('', { status: 429 });
-    return ok(url.pathname === '/api/morechildren.json'
+    return ok(url.pathname === '/api/morechildren'
       ? morePayload(url.searchParams.get('children').split(',').map((id) => comment(id)))
       : threadPayload('stale01', [more(staleIds)]));
   };

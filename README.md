@@ -84,10 +84,27 @@ reddit_thread(url_or_id: "AMA_POST_ID", sort: "qa", expand_more: 2)
 - `expand_more` is an opt-in **extra HTTP request budget**, default 0, max 5, shared by hidden-child batches and continue-thread lookups. Child batches request at most 100 ids, favor shallow/larger branches, and always take priority over stubs. A continuation requests at most 200 comments; newly discovered child ids again take priority. Both paths use the same comment sort, serial queue, authentication and thread cache. At the default queue delay, five uncached requests add roughly six seconds of spacing, plus network time.
 - Cached responses, including stale responses served without a fetch during cooldown, do not spend the HTTP budget. Any actual fetch attempt counts, even if it fails or falls back to stale data; the summary counts fetch attempts, not helper calls. Cache reuse can therefore add comments with zero new HTTP requests. Repeating a request reconstructs the result from the cached initial thread and available expansion batches; it is not a persisted expansion cursor.
 - `details.expansion` reports `comments_added`, `requests`, `pending_ids` (known ids not yet attempted), `unresolved_ids` (attempted but no visible comment returned), and `stubs` (remaining continue-thread branches). `stubs_resolved` counts resolved branch lookups; `unresolved_stubs` lists every remaining parent, including unattempted or invalid/unfetchable parents. These counts are **lower bounds**, not an exact unseen-comment total: one collapsed id can hide a subtree.
+- Child-batch responses are validated before indexed evidence is updated. A malformed response cannot overwrite an existing comment's post ownership or insert unrelated thread data.
 - If expansion fails or is cancelled, already loaded evidence is kept and `details.expansion_stopped` and the compact footer explain why. This is a partial result, not proof that the thread was fully read.
 - Continue-thread stubs can use the same budget. Each valid parent is attempted at most once per call; empty/repeated responses stay unresolved instead of looping. Returned parents are kept only if not already loaded, and deleted bodies are omitted without losing descendants. Rebasing distinguishes explicit depths from inferred ones, including when an ancestor's depth is missing; usable absolute comment/hidden-branch depths are preserved. Malformed reply containers retain the unresolved stub and report a stopped expansion. Both expansion endpoints are validated before indexed evidence is updated; continuations must also match the expected post/branch.
 - Comment sorts are `top` (default), `new`, `controversial`, `confidence`, `old` and `qa`. `old` asks Reddit for the oldest comments first; `qa` requests Reddit's Q&A ordering for AMA-style discussions. They apply to the initial fetch and both expansion endpoints. Compact output still selects highest-score `top_comments` from the fetched set; it does not preserve Reddit's fetched order.
 - `reddit_pack` does not opt into expansion; its request/depth behavior stays unchanged. Comment-permalink subtree routing is not added. No new dependencies, SQLite columns or authentication settings are required.
+
+### Larger listings and post context (unreleased)
+
+```text
+reddit_search(query: "python packaging", subreddits: "Python", limit: 100, format: "compact")
+reddit_trends(subreddits: "all", listing: "hot", order: "reddit", limit: 100, format: "compact")
+```
+
+- `reddit_search.limit` and `reddit_trends.limit` accept up to **100** posts. Defaults remain **8** and **10**; one call fetches one page per requested scope, not an automatic multi-page crawl. Reddit may return fewer posts or no next cursor. Post IDs are deduplicated before applying the result cap.
+- `format="full"` remains the default, including post excerpts. `format="compact"` uses one line per displayed post: subreddit, score, comment count, age, bounded title and Reddit source URL, plus any external destination. Format changes do not change fetching or trend ordering and reuse the same request cache.
+- Long output stops between complete entries instead of cutting a post in half. A `showing K of N; use format=compact or lower limit` notice reports the displayed count. `details.posts` retains all **N** selected results; `details.posts_shown` is **K**, and `details.format` identifies the presentation. A single oversized entry may show zero posts while preserving its structured data.
+- Cursors describe the complete structured result selection, not just the printed entries. If text was shortened, re-run the same page with compact output or a lower limit before paging past unread evidence; format changes alone do not spend another HTTP request while the response is fresh. Keep query/scope/sort/time/order and limit consistent during pagination.
+- Posts preserve `url` as the Reddit permalink. `externalUrl`, when available, is an absolute HTTP(S) destination outside `reddit.com` and its subdomains, for non-self posts only. Invalid destinations and URLs containing user credentials are omitted; Reddit CDN links such as `i.redd.it` may still be destinations.
+- Structured post data also includes `isSelf`, `stickied` and `isVideo`. Output marks sticky posts with `[sticky]` and shows external destinations without replacing source links. Shared thread, account and research-pack output receives this context too; their request/depth limits are unchanged. No new SQLite columns or authentication settings are required.
+
+These listing options are not included in the published 0.2.0 package.
 
 ### Pagination
 
@@ -106,7 +123,7 @@ Rules the code enforces, because Reddit does not error on a bad cursor (it answe
 
 ### Account checks
 
-`reddit_user` fetches `/user/<name>/about.json`, `/submitted.json`, and `/comments.json`:
+`reddit_user` fetches `/user/<name>/about`, `/user/<name>/submitted`, and `/user/<name>/comments` on `api.reddit.com`:
 
 ```
 reddit_user(username: "u/foo", sections: "about,posts", limit: 10)
@@ -116,13 +133,13 @@ reddit_user(username: "foo", sections: "comments", limit: 25, after_comments: "t
 
 Sections are comma-separated (`about`, `posts`, `comments`), default `about,posts`. The `limit` applies to posts and comments alike. Account age and karma are weak signals, not proof of expertise.
 
-Individual section failures do not abort the call: a suspended, deleted, private, or misspelled account produces whatever sections did resolve plus a `fetch errors` line. A string that cannot be a Reddit username at all (over 20 characters, shorter than a real username, or containing characters other than letters, digits, `_`, `-`) is rejected with a specific `Reddit usernames are at most 20 characters` / `too short` / `not a valid Reddit username` error instead of a pointless request. Because Reddit answers `/user/<name>/about.json` with HTTP 200 for banned and suspended accounts (no `is_suspended` flag), the tool reports `no public profile page for this account` when Reddit returns no profile object.
+Individual section failures do not abort the call: a suspended, deleted, private, or misspelled account produces whatever sections did resolve plus a `fetch errors` line. A string that cannot be a Reddit username at all (over 20 characters, shorter than a real username, or containing characters other than letters, digits, `_`, `-`) is rejected with a specific `Reddit usernames are at most 20 characters` / `too short` / `not a valid Reddit username` error instead of a pointless request. A valid user response with `subreddit: null` is reported as `no public profile page for this account`; this alone does not prove suspension. An invalid profile response appears in `fetch errors` rather than being treated as an empty profile.
 
 ## Configuration
 
 ### 1. JSON config (recommended)
 
-Since mid-2026, Reddit requires authentication for `.json` access. Create `~/.pi/agent/reddit-research.json`:
+API requests use `https://api.reddit.com` without a `.json` pathname suffix and include `raw_json=1`. Public post, comment, and canonical links remain on `https://www.reddit.com`. Configure your Reddit session cookie for authenticated access in `~/.pi/agent/reddit-research.json`:
 
 ```json
 {
@@ -171,7 +188,22 @@ Or reference a separate cookie file:
 
 ## Notes
 
-This extension uses Reddit's `.json` endpoints with local SQLite caching. **Since mid-2026, Reddit requires authentication for `.json` access.** Set your cookie in `~/.pi/agent/reddit-research.json`, via `cookieFile`, or via env vars to restore functionality.
+This extension uses Reddit's API JSON responses with local SQLite caching. Set your cookie in `~/.pi/agent/reddit-research.json`, via `cookieFile`, or via env vars. Cookies can expire, and Reddit can restrict access even with a configured cookie.
+
+### Endpoint failures and cache behaviour
+
+Normal requests detect unavailable or incompatible API endpoints; there are no background health probes:
+
+- `REDDIT_API_UNAVAILABLE`: connection, DNS, or TLS failure. Check your network and API host availability.
+- `REDDIT_API_ENDPOINT_GONE`: HTTP 410 for the requested route. API routing may need updating.
+- `REDDIT_API_REDIRECT`: HTTP 3xx. Redirects are not followed, so cookies cannot be forwarded to another host; verify routing first.
+- `REDDIT_API_INVALID_RESPONSE`: invalid JSON or an unexpected Listing, thread, or profile shape. The API may have changed.
+
+These symptoms do **not** prove that Reddit deprecated the API. HTTP 401/403 still indicate an authentication/access failure, HTTP 404 can indicate a missing user/thread/route, HTTP 429 starts a `Retry-After` cooldown (300 seconds when absent/invalid), and HTTP 5xx indicates a server error. Diagnostics exclude response bodies, query strings, cookies, and redirect targets.
+
+Invalid responses are not cached or indexed. Malformed cached payloads are ignored; empty valid Listings are still valid results. Fresh valid cache entries delay network failure detection until another network request is needed. Endpoint errors bypass stale cache, while existing authentication/rate/server-error paths may still return valid stale evidence. Failed cache rows need no manual deletion. An active in-memory cooldown must expire, or you can restart the Pi session; updating a cookie does not itself clear that cooldown.
+
+`reddit_user` and `reddit_pack` retain partial results and expose failures in `details.errors` and a reserved `fetch errors` line. Do not treat partial evidence as a clean success.
 
 Treat Reddit posts and comments as anecdotal evidence, not verified facts.
 
@@ -209,12 +241,18 @@ Requires Node.js 22.19 or newer, matching current Pi requirements. The extension
 ```bash
 npm ci
 npm run check
-npm run smoke:live
+PI_REDDIT_DELAY_MS=2000 npm run smoke:live
 ```
 
 `npm run check` performs strict TypeScript checking and offline regression tests. Tests load the extension with Pi's actual loader, invoke its tools through Pi's agent loop (including argument preparation and validation), and exercise the default TUI renderer. Reddit HTTP responses and the model stream are synthetic in these tests.
 
-`npm run smoke:live` uses real Reddit HTTP with your existing cookie configuration, a fresh temporary SQLite cache, and the same Pi loader/agent loop. Only the model stream is synthetic; no LLM provider is called. It checks all eight tools, smoke-checks rising/controversial and the all/popular feeds, exercises budgeted comment expansion, a 500-comment fetch and `old`/`qa` comment sorts, and verifies page-two non-overlap for search, trends, user posts and user comments when Reddit supplies cursors. A real depth-limited response exposes continuation stubs for a shared-budget check when available; that depth restriction is smoke-only, not a public tool argument. The temporary cache is removed when finished; credentials are never printed. It exits nonzero on HTTP errors, partial user-section errors, stopped comment expansions, or failed assertions.
+The live smoke checks `old`/`qa` sorts and uses a smoke-only depth restriction to expose continuation stubs for a shared-budget check when available.
+
+The live smoke also exercises budgeted comment expansion, a 500-comment fetch, 100-result full/compact listings and post-context fields; stopped expansions fail validation.
+
+`npm run smoke:live` uses real Reddit HTTP with your existing cookie configuration, a fresh temporary SQLite cache, and the same Pi loader/agent loop. Only the model stream is synthetic; no LLM provider is called. Requests are paced at least two seconds apart (a larger `PI_REDDIT_DELAY_MS` is respected). It checks all eight tools, global/scoped search, API/public-link hosts, `raw_json=1` title preservation, and nonoverlapping second-page IDs for search, trends, user posts, and user comments when Reddit supplies cursors. Missing cursors are explicitly reported as unavailable checks. Deterministic offline fixtures also cover literal HTML/entity text.
+
+The temporary cache is removed when finished; credentials are never printed. The smoke runner observes actual HTTP statuses and blocks further network requests after the first 429, even if stale-cache fallback conceals it from a tool. HTTP errors, partial tool failures, or failed assertions exit nonzero and mean live validation is blocked/failed, not accepted. It prints whether the shipped User-Agent or an environment override is in use; for final-default acceptance, unset `PI_REDDIT_USER_AGENT` before running.
 
 Before publishing, run `npm run check`, `npm run smoke:live`, and `npm pack --dry-run`. Existing releases use a package version commit and an annotated `v<version>` tag. Tag and publish the approved integration commit, then verify the npm version, dist tag, `gitHead`, and tarball contents.
 

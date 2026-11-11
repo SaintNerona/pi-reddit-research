@@ -9,30 +9,76 @@ const cache = mkdtempSync(join(tmpdir(), 'pi-reddit-live-'));
 process.env.PI_REDDIT_CACHE_DIR = cache;
 process.env.PI_REDDIT_SQLITE_PATH = join(cache, 'reddit.sqlite');
 process.env.PI_REDDIT_STATUS_FOOTER = 'false';
-const extension = await loadTools();
+const delay = Number(process.env.PI_REDDIT_DELAY_MS);
+process.env.PI_REDDIT_DELAY_MS = String(Number.isFinite(delay) ? Math.max(2000, delay) : 2000);
+const originalFetch = globalThis.fetch;
+const rawTitles = new Map();
+let rateLimited = false;
+globalThis.fetch = async (input, options) => {
+  if (rateLimited) throw new Error('Live smoke stopped after HTTP 429; no further network requests allowed.');
+  const url = new URL(input);
+  assert.equal(url.origin, 'https://api.reddit.com');
+  assert.ok(!url.pathname.endsWith('.json'));
+  assert.equal(url.searchParams.get('raw_json'), '1');
+  assert.equal(options.redirect, 'manual');
+  const response = await originalFetch(input, options);
+  if (response.status === 429) rateLimited = true;
+  // Compare tool post titles to actual raw_json text, without logging response data.
+  if (response.ok) {
+    try {
+      const payload = await response.clone().json();
+      const listings = Array.isArray(payload) ? payload : [payload];
+      for (const listing of listings) {
+        for (const child of listing?.data?.children ?? []) {
+          if (child?.kind === 't3') rawTitles.set(child.data.id, child.data.title);
+        }
+      }
+    } catch { /* The extension must diagnose invalid API responses itself. */ }
+  }
+  return response;
+};
+let extension;
 const call = async (name, args) => {
+  if (rateLimited) throw new Error('HTTP 429: validation blocked; no further requests attempted.');
   const result = await invoke(extension, name, args);
+  if (rateLimited) throw new Error('HTTP 429: validation blocked, even if stale evidence was returned.');
   if (result.isError) throw new Error(result.content.map((c) => c.text ?? '').join('\n'));
   if (result.details?.errors?.length) throw new Error(result.details.errors.join('; '));
   if (result.details?.expansion_stopped) throw new Error(result.details.expansion_stopped);
+  const posts = result.details?.posts ?? (result.details?.post ? [result.details.post] : []);
+  for (const post of posts) {
+    assert.equal(new URL(post.url).origin, 'https://www.reddit.com');
+    assert.ok(rawTitles.has(post.id), `${name}: missing raw title fixture`);
+    assert.equal(post.title, rawTitles.get(post.id), `${name}: raw_json title changed`);
+  }
+  for (const comment of result.details?.comments ?? []) {
+    if (comment.url) assert.equal(new URL(comment.url).origin, 'https://www.reddit.com');
+  }
   console.log(`${name}: OK`);
   return result;
 };
 const pages = async (name, args, key = 'after') => {
   const first = await call(name, args);
+  const items = key === 'after_comments' ? 'comments' : 'posts';
+  assert.ok(first.details[items].length > 0, `${name}: empty first page`);
+  if (args.sections?.includes('about')) assert.ok(first.details.about?.username, `${name}: missing profile`);
   const cursor = key === 'after' ? first.details.cursors.after : first.details.cursors[key === 'after_posts' ? 'posts' : 'comments']?.after;
   if (!cursor) { console.log(`${name}: no next cursor; page-two check unavailable`); return; }
   const second = await call(name, { ...args, [key]: cursor });
-  const items = key === 'after_comments' ? 'comments' : 'posts';
   const ids = new Set(first.details[items].map((p) => p.id));
   assert.ok(second.details[items].length > 0, `${name}: empty second page`);
   assert.ok(second.details[items].every((p) => !ids.has(p.id)), `${name}: overlapping page ids`);
   console.log(`${name}: page-two ids do not overlap page one`);
 };
 try {
-  await call('reddit_url_extract', { url_or_id: 'https://www.reddit.com/user/spez/comments/' });
-  await pages('reddit_search', { query: 'python', subreddits: 'learnpython', sort: 'new', limit: 2 });
-  await pages('reddit_trends', { subreddits: 'learnpython', listing: 'new', limit: 2 });
+  extension = await loadTools();
+  console.log(`Live request delay: ${process.env.PI_REDDIT_DELAY_MS}ms; User-Agent: ${process.env.PI_REDDIT_USER_AGENT ? 'configured override' : 'shipped default'}`);
+  const extracted = await call('reddit_url_extract', { url_or_id: 'https://www.reddit.com/user/spez/comments/' });
+  assert.equal(new URL(extracted.details.canonical_url).origin, 'https://www.reddit.com');
+  const global = await call('reddit_search', { query: 'python', sort: 'new', limit: 2 });
+  assert.ok(global.details.posts.length > 0);
+  await pages('reddit_search', { query: 'python', subreddits: 'learnpython', sort: 'new', limit: 2, format: 'compact' });
+  await pages('reddit_trends', { subreddits: 'learnpython', listing: 'new', limit: 2, format: 'compact' });
   for (const mode of ['rising', 'controversial']) {
     const result = await call('reddit_trends', { subreddits: 'learnpython', listing: mode, time: 'week', limit: 2 });
     assert.equal(result.details.order, 'reddit');
@@ -42,6 +88,40 @@ try {
     const result = await call('reddit_trends', { subreddits: sub, listing: 'hot', order: 'reddit', limit: 2 });
     assert.equal(result.details.order, 'reddit');
     assert.ok(result.details.posts.length > 0, `r/${sub}: no posts returned`);
+  }
+  for (const [name, args] of [
+    ['reddit_search', { query: 'python', subreddits: 'learnpython', sort: 'new', limit: 100 }],
+    ['reddit_trends', { subreddits: 'all', listing: 'hot', order: 'reddit', limit: 100 }],
+  ]) {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (...args) => { fetches++; return originalFetch(...args); };
+    try {
+      const full = await call(name, args);
+      const compact = await call(name, { ...args, format: 'compact' });
+      assert.equal(fetches, 1, `${name}: format-only change should reuse the cached listing`);
+      assert.equal(full.details.format, 'full');
+      assert.equal(compact.details.format, 'compact');
+      assert.ok(full.details.posts.length > 0 && full.details.posts.length <= 100);
+      assert.equal(new Set(full.details.posts.map((post) => post.id)).size, full.details.posts.length);
+      assert.deepEqual(compact.details.posts.map((post) => post.id), full.details.posts.map((post) => post.id));
+      assert.deepEqual(compact.details.cursors, full.details.cursors);
+      assert.ok(compact.details.posts_shown >= full.details.posts_shown);
+      for (const post of compact.details.posts) {
+        for (const key of ['isSelf', 'stickied', 'isVideo']) assert.equal(typeof post[key], 'boolean');
+        assert.equal(new URL(post.url).hostname, 'www.reddit.com');
+        if (post.externalUrl) {
+          const destination = new URL(post.externalUrl);
+          assert.ok(['http:', 'https:'].includes(destination.protocol));
+          assert.equal(post.isSelf, false);
+          assert.ok(destination.hostname !== 'reddit.com' && !destination.hostname.endsWith('.reddit.com'));
+          assert.equal(destination.username + destination.password, '');
+        }
+      }
+      console.log(`${name}: ${full.details.posts.length} selected, ${full.details.posts_shown} full / ${compact.details.posts_shown} compact entries shown; format-only reuse made no extra HTTP request`);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   }
   await pages('reddit_user', { username: 'spez', sections: 'about,posts', limit: 2 }, 'after_posts');
   await pages('reddit_user', { username: 'spez', sections: 'comments', limit: 2 }, 'after_comments');
@@ -59,7 +139,7 @@ try {
   const batches = [];
   globalThis.fetch = async (input, options) => {
     const url = new URL(input);
-    if (url.pathname === '/api/morechildren.json') {
+    if (url.pathname === '/api/morechildren') {
       expansionHttp++;
       const ids = url.searchParams.get('children').split(',');
       assert.ok(ids.length <= 100, 'Expansion exceeded 100 ids per request');
@@ -97,9 +177,9 @@ try {
   let continuationHttp = 0, continuationExtras = 0;
   globalThis.fetch = (input, options) => {
     const url = new URL(input);
-    if (url.pathname === `/comments/${discussion.id}.json`) url.searchParams.set('depth', '1');
+    if (url.pathname === `/comments/${discussion.id}`) url.searchParams.set('depth', '1');
     if (url.pathname.includes('/_/')) { continuationHttp++; continuationExtras++; }
-    else if (url.pathname === '/api/morechildren.json') continuationExtras++;
+    else if (url.pathname === '/api/morechildren') continuationExtras++;
     return continuationFetch(url, options);
   };
   try {
@@ -121,12 +201,15 @@ try {
   const pack = await call('reddit_pack', { topic: 'python', subreddits: 'learnpython', depth: 'quick', max_posts: 2, comments_per_post: 2 });
   assert.ok(pack.details.posts.length > 0);
   assert.ok(pack.details.commented_post_count > 0);
-  await call('reddit_subreddits', { query: 'python', limit: 2 });
-  await call('reddit_resolve_subreddits', { topic: 'python', limit: 2, refresh: true });
-  console.log('Live Reddit smoke checks passed.');
+  const subreddits = await call('reddit_subreddits', { query: 'python', limit: 2 });
+  assert.ok(subreddits.details.subreddits.length > 0);
+  const resolved = await call('reddit_resolve_subreddits', { topic: 'python', limit: 2, refresh: true });
+  assert.ok(resolved.details.subreddits.length > 0);
+  console.log('Live Reddit smoke checks passed (including raw_json title preservation).');
 } catch (error) {
   console.error(`Live Reddit smoke blocked/failed: ${error.message}`);
   process.exitCode = 1;
 } finally {
+  globalThis.fetch = originalFetch;
   rmSync(cache, { recursive: true, force: true });
 }
