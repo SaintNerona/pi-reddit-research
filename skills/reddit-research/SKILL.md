@@ -11,7 +11,7 @@ Use the local Reddit tools when the user asks what people on Reddit say, recomme
 
 - Use `reddit_pack` for most research questions. It searches posts and fetches top comments for a small evidence pack.
 - Use `reddit_search` when you only need candidate posts or want to find whether a topic/repo/error was discussed.
-- Use `reddit_thread` when the user gives a Reddit URL or one thread from `reddit_search` looks important.
+- Use `reddit_thread` when the user gives a Reddit URL or one thread from `reddit_search` looks important. Inspect its completeness footer before treating the fetched comments as the full discussion.
 - Use `reddit_user` when a claim's trustworthiness matters, when the user names an account, or when the strongest evidence rests on one or two accounts.
 - Use `reddit_resolve_subreddits` when the user asks where a topic is discussed or when a focused subreddit scope would improve search.
 - Use `reddit_subreddits` only for raw subreddit search when ranking is not needed.
@@ -24,6 +24,14 @@ Use the local Reddit tools when the user asks what people on Reddit say, recomme
 - Specify `order="reddit"` when native order matters, including `all`/`popular` feeds. With several subreddits, results interleave by native position (round-robin), not by a cross-community popularity rank.
 - `time` applies only to `top` and `controversial`. Rising may return few posts; a rising position is not proof of expertise, consensus, or quality.
 - A JSON 403 `reason` is a per-resource denial; do not assume the cookie expired or retry the denied community repeatedly. Unrelated research can continue. Block-page 403s and 429s still trigger cooldown.
+
+## Thread Completeness
+
+- `reddit_thread.comment_limit` defaults to 50 and accepts up to 500; 500 can transfer about 1 MB. Compact output still selects `top_comments` (default 12, max 40), not every fetched comment.
+- A `not loaded:` line reports known hidden ids and collapsed branches. For deeper research, opt into `expand_more=1..5`: this caps extra HTTP requests, with at most 100 ids per request. It defaults to 0; do not expand every thread automatically.
+- Expansion follows nested placeholders, deduplicates comments and preserves parent ids/depth. Cache hits spend no HTTP budget; a result can add comments without making a new HTTP request.
+- Pending/unresolved ids are lower bounds, not exact unseen-comment totals. `expansion_stopped` means evidence is partial: report the limitation instead of claiming the entire discussion was reviewed.
+- Continue-thread stubs are reported but cannot be expanded yet. `reddit_pack` still uses its existing fetch behavior.
 
 ## Listing Volume and Post Context
 

@@ -10,7 +10,7 @@ Registers these pi tools:
 - `reddit_resolve_subreddits` — find and rank subreddit candidates for a topic.
 - `reddit_pack` — build a compact evidence pack from posts and top comments.
 - `reddit_search` — search Reddit posts without fetching full comment threads.
-- `reddit_thread` — fetch one thread and top comments.
+- `reddit_thread` — fetch one thread and top comments, report collapsed branches, and optionally expand hidden comments within a request budget.
 - `reddit_user` — check a public account: age, karma, account signals, recent posts and comments.
 - `reddit_subreddits` — raw subreddit search.
 - `reddit_trends` — inspect hot/top/new/rising/controversial posts in subreddits, including `all` and `popular`.
@@ -68,6 +68,22 @@ reddit_trends(subreddits: "popular", listing: "new", order: "reddit")
 - `all` and `popular` use the existing subreddit listing path, not your personalized home feed. Reddit may filter their results; do not treat either as exhaustive.
 - Pagination works as before; reuse the same listing, scope, time **and order**.
 
+### Thread completeness and comment expansion
+
+```
+reddit_thread(url_or_id: "POST_ID", comment_limit: 500)
+reddit_thread(url_or_id: "POST_ID", comment_limit: 50, expand_more: 2, top_comments: 20)
+```
+
+- `comment_limit` keeps its default of 50 and now accepts up to 500. A large response can transfer about 1 MB; `top_comments` still controls compact output (default 12, max 40). `details.comments_fetched` counts the visible, non-deleted comments parsed before that output selection.
+- With the default limit and `expand_more=0`, no extra requests are made. Raising `comment_limit` can increase response size. Collapsed placeholders are no longer silently discarded: a reserved `not loaded:` footer reports unique known hidden ids, collapsed branches and continue-thread stubs, even if the evidence text is truncated. `details.more` contains the remaining `nodes`, unique `hiddenIds` count and `stubs` count.
+- `expand_more` is an opt-in **extra HTTP request budget**, default 0, max 5. It requests at most 100 child ids per batch, favors shallow/larger branches, follows newly returned placeholders and deduplicates comments. Reddit may return additional descendants alongside those requested ids. It uses the same comment sort, request queue, authentication and thread cache. At the default queue delay, five uncached requests add roughly six seconds of spacing, plus network time.
+- Cached or stale expansion responses do not spend the HTTP budget; the summary reports actual fetch attempts, not helper calls. Cache reuse can therefore add comments with zero new HTTP requests. Repeating a request reconstructs the result from the cached initial thread and available expansion batches; it is not a persisted expansion cursor.
+- `details.expansion` reports `comments_added`, `requests`, `pending_ids` (known ids not yet attempted), `unresolved_ids` (attempted but no visible comment returned) and `stubs`. These id counts are **lower bounds**, not an exact unseen-comment total: one collapsed id can hide a subtree.
+- Child-batch responses are validated before indexed evidence is updated. A malformed response cannot overwrite an existing comment's post ownership or insert unrelated thread data.
+- If expansion fails or is cancelled, already loaded evidence is kept and `details.expansion_stopped` and the compact footer explain why. This is a partial result, not proof that the thread was fully read.
+- Continue-thread stubs are counted but **not expanded** in this change. `reddit_pack` does not opt into expansion; its output and request behavior stay unchanged.
+
 ### Larger listings and post context (unreleased)
 
 ```text
@@ -82,7 +98,7 @@ reddit_trends(subreddits: "all", listing: "hot", order: "reddit", limit: 100, fo
 - Posts preserve `url` as the Reddit permalink. `externalUrl`, when available, is an absolute HTTP(S) destination outside `reddit.com` and its subdomains, for non-self posts only. Invalid destinations and URLs containing user credentials are omitted; Reddit CDN links such as `i.redd.it` may still be destinations.
 - Structured post data also includes `isSelf`, `stickied` and `isVideo`. Output marks sticky posts with `[sticky]` and shows external destinations without replacing source links. Shared thread, account and research-pack output receives this context too; their request/depth limits are unchanged. No new SQLite columns or authentication settings are required.
 
-These listing options are not included in the published 0.2.0 package. Comment-expansion and subreddit-metadata changes remain separate work.
+These listing options are not included in the published 0.2.0 package.
 
 ### Pagination
 
@@ -224,7 +240,7 @@ PI_REDDIT_DELAY_MS=2000 npm run smoke:live
 
 `npm run check` performs strict TypeScript checking and offline regression tests. Tests load the extension with Pi's actual loader, invoke its tools through Pi's agent loop (including argument preparation and validation), and exercise the default TUI renderer. Reddit HTTP responses and the model stream are synthetic in these tests.
 
-The live smoke also exercises 100-result full/compact listings and post-context fields.
+The live smoke also exercises budgeted comment expansion, a 500-comment fetch, 100-result full/compact listings and post-context fields; stopped expansions fail validation.
 
 `npm run smoke:live` uses real Reddit HTTP with your existing cookie configuration, a fresh temporary SQLite cache, and the same Pi loader/agent loop. Only the model stream is synthetic; no LLM provider is called. Requests are paced at least two seconds apart (a larger `PI_REDDIT_DELAY_MS` is respected). It checks all eight tools, global/scoped search, API/public-link hosts, `raw_json=1` title preservation, and nonoverlapping second-page IDs for search, trends, user posts, and user comments when Reddit supplies cursors. Missing cursors are explicitly reported as unavailable checks. Deterministic offline fixtures also cover literal HTML/entity text.
 

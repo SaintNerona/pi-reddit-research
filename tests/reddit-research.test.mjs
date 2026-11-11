@@ -606,6 +606,263 @@ test('trends preparation normalizes listing/order and defaults invalid values sa
   assert.equal(tool.prepareArguments({ listing: 'best' }).listing, 'hot');
 });
 
+const more = (children, parent = 't3_abc123', depth = 0, count = children.length) => ({ kind: 'more', data: {
+  id: children.length ? children[0] : '_', parent_id: parent, depth, count, children,
+} });
+let expansionPostId;
+const expansionParents = (things) => things.map((thing) => {
+  if (thing?.data?.parent_id === 't3_abc123') thing.data.parent_id = `t3_${expansionPostId}`;
+  return thing;
+});
+const threadPayload = (id, children, long = false) => {
+  expansionPostId = id;
+  return [listing([post(id, 'Alpha', 1, long)]), listing(expansionParents(children))];
+};
+const morePayload = (things) => ({ json: { errors: [], data: { things: expansionParents(things) } } });
+const expansionRequests = (before) => requests.slice(before).filter((url) => url.pathname === '/api/morechildren');
+
+test('reddit_thread fetch cap is 500, default remains 50, and expansion is opt-in', async () => {
+  respond = (url) => ok(threadPayload(url.pathname.split('/')[2].replace('.json', ''), [comment('cap001'), more(['cap002'])]));
+  const before = requests.length;
+  const large = await call('reddit_thread', { url_or_id: 'cap500', comment_limit: 9999 });
+  assert.equal(requests[before].searchParams.get('limit'), '500');
+  assert.equal(large.details.more.hiddenIds, 1);
+  assert.equal(large.details.expansion, undefined);
+  assert.match(text(large), /not loaded: 1 known hidden comment ids/);
+  await call('reddit_thread', { url_or_id: 'cap050' });
+  assert.equal(requests[before + 1].searchParams.get('limit'), '50');
+  assert.equal(expansionRequests(before).length, 0);
+  const prepare = extension.tools.get('reddit_thread').definition.prepareArguments;
+  assert.equal(prepare({ expand_more: 999 }).expand_more, 5);
+  assert.equal(prepare({ expand_more: -1 }).expand_more, 0);
+  assert.equal(prepare({ expand_more: '2' }).expand_more, 2);
+});
+
+test('collapsed branches, nested deleted parents and continue-thread stubs are reported under truncation', async () => {
+  const removed = comment('gone00', '[removed]');
+  removed.data.replies = listing([comment('kept00'), more(['hidden1', 'hidden1'], 't1_gone00', 1, 9)]);
+  respond = () => ok(threadPayload('tree001', [removed, more([], 't1_kept00', 3, 0)], true));
+  const before = requests.length;
+  const result = await call('reddit_thread', { url_or_id: 'tree001', expand_more: 0 });
+  assert.equal(requests.length - before, 1);
+  assert.equal(result.details.comments.length, 1);
+  assert.equal(result.details.comments[0].depth, 1);
+  assert.equal(result.details.more.hiddenIds, 1, 'count is unique known ids, not Reddit count=9');
+  assert.equal(result.details.more.stubs, 1);
+  assert.equal(result.details.more.nodes[0].parentId, 't1_gone00');
+  assert.deepEqual(result.details.more.nodes[0].children, ['hidden1']);
+  assert.match(text(result), /truncated/);
+  assert.match(text(result), /not loaded:/);
+  assert.match(text(result), /continue-thread stubs: 1 \(not expanded\)/);
+});
+
+test('expansion chunks at 100 and spends at most its actual HTTP budget', async () => {
+  const ids = Array.from({ length: 250 }, (_, i) => `wide${String(i).padStart(3, '0')}`);
+  respond = (url) => url.pathname === '/api/morechildren'
+    ? ok(morePayload(url.searchParams.get('children').split(',').map((id) => comment(id))))
+    : ok(threadPayload('wide001', [comment('start01'), more(ids, 't3_wide001')]));
+  const before = requests.length;
+  const result = await call('reddit_thread', { url_or_id: 'wide001', expand_more: 2, top_comments: 40 });
+  const calls = expansionRequests(before);
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((url) => url.searchParams.get('children').split(',').length <= 100));
+  assert.equal(calls[0].searchParams.get('api_type'), 'json');
+  assert.equal(calls[0].searchParams.get('link_id'), 't3_wide001');
+  assert.equal(calls[0].searchParams.get('raw_json'), '1');
+  assert.equal(calls[0].searchParams.has('limit_children'), false);
+  assert.equal(result.details.comments_fetched, 201);
+  assert.equal(result.details.expansion.comments_added, 200);
+  assert.equal(result.details.expansion.requests, calls.length);
+  assert.equal(result.details.expansion.pending_ids.length, 50);
+  assert.deepEqual(result.details.expansion.unresolved_ids, []);
+  assert.equal(result.details.more.hiddenIds, 50);
+  assert.match(text(result), /loaded \+200 comments in 2 HTTP requests/);
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(join(cache, 'reddit.sqlite'));
+  try { assert.equal(db.prepare('SELECT post_id FROM comments WHERE id = ?').get('wide199').post_id, 'wide001'); }
+  finally { db.close(); }
+});
+
+test('expand_more cannot exceed five HTTP requests even when every response reveals another branch', async () => {
+  let step = 0;
+  respond = (url) => {
+    if (url.pathname !== '/api/morechildren') return ok(threadPayload('budget5', [more(['step000'])]));
+    const id = `step${String(step++).padStart(3, '0')}`;
+    return ok(morePayload([comment(id), more([`step${String(step).padStart(3, '0')}`])]));
+  };
+  const before = requests.length;
+  const result = await call('reddit_thread', { url_or_id: 'budget5', expand_more: 999 });
+  assert.equal(expansionRequests(before).length, 5);
+  assert.equal(result.details.expansion.requests, 5);
+  assert.equal(result.details.expansion.comments_added, 5);
+  assert.deepEqual(result.details.expansion.pending_ids, ['step005']);
+});
+
+test('expansion follows nested more, deduplicates overlap/descendants, preserves depth and reports unresolved ids', async () => {
+  let batch = 0;
+  respond = (url) => {
+    if (url.pathname !== '/api/morechildren') return ok(threadPayload('nested1', [comment('root001'), more(['childa', 'gone01']), more([], 't1_childb', 3)]));
+    if (batch++ === 0) {
+      const a = comment('childa'); Object.assign(a.data, { parent_id: 't1_root001', depth: 1, score: 10 });
+      const b = comment('childb'); Object.assign(b.data, { parent_id: 't1_childa', depth: 2, score: 9 });
+      return ok(morePayload([a, b, comment('root001'), comment('gone01', '[deleted]'), more(['childb', 'childc', 'childa']), more([], 't1_childb', 3)]));
+    }
+    assert.equal(url.searchParams.get('children'), 'childc');
+    return ok(morePayload([comment('childa'), comment('childc'), more(['childa', 'gone01'])]));
+  };
+  const before = requests.length;
+  const result = await call('reddit_thread', { url_or_id: 'nested1', expand_more: 5, top_comments: 40 });
+  assert.equal(expansionRequests(before).length, 2);
+  assert.equal(result.details.comments_fetched, 4);
+  assert.equal(new Set(result.details.comments.map((c) => c.id)).size, 4);
+  assert.equal(result.details.comments.find((c) => c.id === 'childb').depth, 2);
+  assert.equal(result.details.comments.find((c) => c.id === 'childb').parentId, 't1_childa');
+  assert.equal(result.details.expansion.comments_added, 3);
+  assert.deepEqual(result.details.expansion.pending_ids, []);
+  assert.deepEqual(result.details.expansion.unresolved_ids, ['gone01']);
+  assert.equal(result.details.more.hiddenIds, 1);
+  assert.equal(result.details.more.stubs, 1, 'same stub is not counted twice');
+  assert.equal(result.details.expansion_stopped, undefined);
+});
+
+test('expansion prioritizes shallow branches, then larger branches, and keeps sort mapping', async () => {
+  respond = (url) => url.pathname === '/api/morechildren' ? ok(morePayload([])) : ok(threadPayload('prior01', [
+    more(['deep001'], 't1_deep', 3, 100), more(['small01'], 't3_prior01', 0, 1), more(['large01'], 't3_prior01', 0, 9),
+  ]));
+  const before = requests.length;
+  const result = await call('reddit_thread', { url_or_id: 'prior01', sort: 'confidence', expand_more: 5 });
+  const calls = expansionRequests(before);
+  assert.equal(calls.length, 1, 'empty responses do not cause repeated attempts');
+  assert.equal(calls[0].searchParams.get('children'), 'large01,small01,deep001');
+  assert.equal(calls[0].searchParams.get('sort'), 'confidence');
+  assert.equal(requests[before].searchParams.get('sort'), 'confidence');
+  assert.equal(result.details.expansion.unresolved_ids.length, 3);
+  assert.equal(result.details.expansion.pending_ids.length, 0);
+});
+
+test('cached expansions spend no HTTP budget and can continue to the next uncached batch', async () => {
+  const ids = Array.from({ length: 150 }, (_, i) => `cache${String(i).padStart(3, '0')}`);
+  respond = (url) => url.pathname === '/api/morechildren'
+    ? ok(morePayload(url.searchParams.get('children').split(',').map((id) => comment(id))))
+    : ok(threadPayload('cache01', [more(ids)]));
+  const first = await call('reddit_thread', { url_or_id: 'cache01', expand_more: 1 });
+  assert.equal(first.details.expansion.requests, 1);
+  assert.equal(first.details.expansion.pending_ids.length, 50);
+  const before = requests.length;
+  const second = await call('reddit_thread', { url_or_id: 'cache01', expand_more: 1 });
+  assert.equal(second.details.comments_fetched, 150);
+  assert.equal(expansionRequests(before).length, 1);
+  assert.equal(second.details.expansion.requests, 1);
+  assert.equal(second.details.expansion.pending_ids.length, 0);
+  const cached = await call('reddit_thread', { url_or_id: 'cache01', expand_more: 1 });
+  assert.equal(cached.details.expansion.requests, 0);
+  assert.equal(cached.details.comments_fetched, 150);
+});
+
+for (const kind of ['network', 'http', 'json-errors', 'malformed', 'invalid-json', 'invalid-node']) {
+  test(`mid-expansion ${kind} failure preserves loaded evidence and reports why it stopped`, async () => {
+    const id = `fail${['network', 'http', 'json-errors', 'malformed', 'invalid-json', 'invalid-node'].indexOf(kind)}00`;
+    let batch = 0;
+    respond = (url) => {
+      if (url.pathname !== '/api/morechildren') return ok(threadPayload(id, [comment('before1'), more(['first01'])]));
+      if (batch++ === 0) return ok(morePayload([comment('first01'), more(['second1'])]));
+      if (kind === 'network') throw new Error('Synthetic network failure.');
+      if (kind === 'http') return new Response('Synthetic server failure.', { status: 503 });
+      if (kind === 'json-errors') return ok({ json: { errors: [['BAD_THING_ID', 'bad id', 'children']] } });
+      if (kind === 'invalid-json') return new Response('{not json');
+      if (kind === 'invalid-node') return ok(morePayload([{ kind: 't1', data: {} }]));
+      return ok({ json: { errors: [], data: { things: 'not an array' } } });
+    };
+    const before = requests.length;
+    const result = await call('reddit_thread', { url_or_id: id, expand_more: 5 });
+    assert.equal(result.details.comments_fetched, 2);
+    assert.deepEqual(result.details.comments.map((c) => c.id).sort(), ['before1', 'first01']);
+    assert.equal(expansionRequests(before).length, 2);
+    assert.equal(result.details.expansion.requests, 2);
+    assert.equal(result.details.expansion.comments_added, 1);
+    assert.deepEqual(result.details.expansion.unresolved_ids, ['second1']);
+    assert.ok(result.details.expansion_stopped);
+    assert.match(text(result), /expansion_stopped:/);
+  });
+}
+
+test('continue-thread-only and fully loaded threads do not spend an expansion budget', async () => {
+  respond = (url) => ok(threadPayload(url.pathname.split('/')[2].replace('.json', ''), url.pathname.includes('stub001') ? [more([], 't1_root', 4)] : [comment('full001')]));
+  const before = requests.length;
+  const stub = await call('reddit_thread', { url_or_id: 'stub001', expand_more: 5 });
+  assert.equal(stub.details.more.stubs, 1);
+  assert.equal(stub.details.expansion.requests, 0);
+  assert.equal(stub.details.more.hiddenIds, 0);
+  assert.doesNotMatch(text(stub), /Pass expand_more/);
+  const full = await call('reddit_thread', { url_or_id: 'full001', expand_more: 5 });
+  assert.equal(full.details.expansion.requests, 0);
+  assert.equal(full.details.more.nodes.length, 0);
+  assert.equal(expansionRequests(before).length, 0);
+});
+
+test('malformed child batches cannot overwrite indexed ownership before rejection', async () => {
+  respond = (url) => url.pathname === '/api/morechildren'
+    ? ok(threadPayload('wrongidx', [comment('indexpar'), comment('foreignxx')]))
+    : ok(threadPayload('indexok', [comment('indexpar'), more(['indexkid'])]));
+  const result = await call('reddit_thread', { url_or_id: 'indexok', expand_more: 1 });
+  assert.ok(result.details.expansion_stopped);
+  assert.equal(result.details.comments_fetched, 1);
+  assert.equal(result.details.expansion.requests, 1);
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(join(cache, 'reddit.sqlite'));
+  try {
+    assert.equal(db.prepare('SELECT post_id FROM comments WHERE id = ?').get('indexpar').post_id, 'indexok');
+    assert.equal(db.prepare('SELECT id FROM comments WHERE id = ?').get('foreignxx'), undefined);
+    assert.equal(db.prepare('SELECT id FROM posts WHERE id = ?').get('wrongidx'), undefined);
+  } finally { db.close(); }
+});
+
+for (const mismatch of ['post', 'parent', 'branch', 'nested']) {
+  test(`expansion rejects ${mismatch} ownership mismatches before changing evidence`, async () => {
+    const source = `own${mismatch}`;
+    const foreign = comment('foreignown');
+    Object.assign(foreign.data, { parent_id: 't3_otherown', link_id: 't3_otherown' });
+    respond = () => ok(threadPayload('otherown', [foreign]));
+    await call('reddit_thread', { url_or_id: 'otherown' });
+    respond = (url) => {
+      if (url.pathname !== '/api/morechildren') return ok(threadPayload(source, [comment('ownedroot'), more(['wantedown'])]));
+      const good = comment('wantedown'); good.data.parent_id = `t3_${source}`;
+      const bad = structuredClone(foreign);
+      if (mismatch === 'post') bad.data.parent_id = `t3_${source}`;
+      if (mismatch === 'parent') delete bad.data.link_id;
+      if (mismatch === 'branch') { delete bad.data.link_id; bad.data.parent_id = 't1_unrelated'; }
+      if (mismatch === 'nested') { good.data.replies = listing([bad]); return ok(morePayload([good])); }
+      return ok(morePayload([good, bad]));
+    };
+    const result = await call('reddit_thread', { url_or_id: source, expand_more: 1 });
+    assert.match(result.details.expansion_stopped, /another post|unrelated branch/);
+    assert.equal(result.details.expansion.comments_added, 0);
+    assert.deepEqual(result.details.comments.map((c) => c.id), ['ownedroot']);
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(join(cache, 'reddit.sqlite'));
+    try {
+      assert.equal(db.prepare('SELECT post_id FROM comments WHERE id = ?').get('foreignown').post_id, 'otherown');
+      assert.equal(db.prepare('SELECT id FROM comments WHERE id = ?').get('wantedown'), undefined);
+    } finally { db.close(); }
+  });
+}
+
+test('cancelling expansion keeps the fetched thread and does not fetch another batch', async () => {
+  const controller = new AbortController();
+  respond = (url) => {
+    assert.notEqual(url.pathname, '/api/morechildren');
+    controller.abort(new Error('Synthetic cancellation.'));
+    return ok(threadPayload('cancel1', [comment('kept001'), more(['hidden2'])]));
+  };
+  const tool = extension.tools.get('reddit_thread').definition;
+  const before = requests.length;
+  const result = await tool.execute('cancel-expansion', tool.prepareArguments({ url_or_id: 'cancel1', expand_more: 5 }), controller.signal, undefined, {});
+  assert.equal(requests.length - before, 1);
+  assert.equal(result.details.comments_fetched, 1);
+  assert.equal(result.details.expansion.requests, 0);
+  assert.equal(result.details.expansion_stopped, 'Expansion cancelled.');
+});
+
 for (const [name, fallback] of [['reddit_search', 8], ['reddit_trends', 10]]) {
   test(`${name} keeps default limits, caps at 100 and normalizes output format`, async () => {
     const tool = extension.tools.get(name).definition;
@@ -859,4 +1116,26 @@ test('403 resource denials do not block unrelated uncached requests; block/rate-
   await runCase('invalid Retry-After', 403, '', { 'retry-after': 'invalid' });
   await runCase('429 reason still rate limited', 429, '{"reason":"private"}', { 'retry-after': '30' });
   await runCase('cookie refreshed', 403, '<html>blocked</html>', {}, false, true);
+
+  now += 600000;
+  const staleIds = Array.from({ length: 150 }, (_, i) => `stale${String(i).padStart(3, '0')}`);
+  respond = (url) => {
+    now += 251;
+    if (url.searchParams.get('q') === 'expansion-rate-limit') return new Response('', { status: 429 });
+    return ok(url.pathname === '/api/morechildren'
+      ? morePayload(url.searchParams.get('children').split(',').map((id) => comment(id)))
+      : threadPayload('stale01', [more(staleIds)]));
+  };
+  const seeded = await call('reddit_thread', { url_or_id: 'stale01', expand_more: 1 });
+  assert.equal(seeded.details.expansion.comments_added, 100);
+  now += 21600001; // Expire the default six-hour thread/expansion cache.
+  const blocked = await invoke(extension, 'reddit_search', { query: 'expansion-rate-limit' });
+  assert.equal(blocked.isError, true);
+  const beforeStale = requests.length;
+  const stale = await call('reddit_thread', { url_or_id: 'stale01', expand_more: 2 });
+  assert.equal(requests.length, beforeStale, 'stale initial/expansion data is served during cooldown; uncached batch cannot fetch');
+  assert.equal(stale.details.comments_fetched, 100);
+  assert.equal(stale.details.expansion.requests, 0, 'stale helper successes are not fresh HTTP calls');
+  assert.equal(stale.details.expansion.unresolved_ids.length, 50);
+  assert.match(stale.details.expansion_stopped, /cooling down/);
 });

@@ -44,6 +44,7 @@ const call = async (name, args) => {
   if (rateLimited) throw new Error('HTTP 429: validation blocked, even if stale evidence was returned.');
   if (result.isError) throw new Error(result.content.map((c) => c.text ?? '').join('\n'));
   if (result.details?.errors?.length) throw new Error(result.details.errors.join('; '));
+  if (result.details?.expansion_stopped) throw new Error(result.details.expansion_stopped);
   const posts = result.details?.posts ?? (result.details?.post ? [result.details.post] : []);
   for (const post of posts) {
     assert.equal(new URL(post.url).origin, 'https://www.reddit.com');
@@ -127,6 +128,40 @@ try {
   const candidates = await call('reddit_search', { query: 'python', subreddits: 'learnpython', limit: 2 });
   assert.ok(candidates.details.posts.length > 0);
   await call('reddit_thread', { url_or_id: candidates.details.posts[0].id, top_comments: 2, comment_limit: 10 });
+  const discussions = await call('reddit_trends', { subreddits: 'LocalLLaMA', listing: 'top', time: 'month', limit: 3, order: 'reddit' });
+  const discussion = [...discussions.details.posts].sort((a, b) => b.numComments - a.numComments)[0];
+  assert.ok(discussion, 'No discussion available for expansion smoke check');
+  const threadArgs = { url_or_id: discussion.id, comment_limit: 5, top_comments: 40 };
+  const initial = await call('reddit_thread', threadArgs);
+  assert.ok(initial.details.more.hiddenIds > 0, 'No collapsed ids available; expansion smoke not exercised');
+  const originalFetch = globalThis.fetch;
+  let expansionHttp = 0;
+  const batches = [];
+  globalThis.fetch = async (input, options) => {
+    const url = new URL(input);
+    if (url.pathname === '/api/morechildren') {
+      expansionHttp++;
+      const ids = url.searchParams.get('children').split(',');
+      assert.ok(ids.length <= 100, 'Expansion exceeded 100 ids per request');
+      batches.push(ids.length);
+    }
+    return originalFetch(input, options);
+  };
+  let expanded;
+  try {
+    expanded = await call('reddit_thread', { ...threadArgs, expand_more: 2 });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  assert.ok(expansionHttp > 0 && expansionHttp <= 2);
+  assert.equal(expanded.details.expansion.requests, expansionHttp);
+  assert.ok(expanded.details.comments_fetched >= initial.details.comments_fetched);
+  assert.equal(new Set(expanded.details.comments.map((c) => c.id)).size, expanded.details.comments.length);
+  assert.ok(expanded.details.expansion.pending_ids.every((id) => !expanded.details.expansion.unresolved_ids.includes(id)));
+  console.log(`thread expansion: ${initial.details.comments_fetched} -> ${expanded.details.comments_fetched} fetched comments; ${expansionHttp} HTTP requests; batch sizes ${batches.join(',')}; pending ${expanded.details.expansion.pending_ids.length}; unresolved ${expanded.details.expansion.unresolved_ids.length}; stubs ${expanded.details.more.stubs}`);
+  const largeThread = await call('reddit_thread', { url_or_id: discussion.id, comment_limit: 500, top_comments: 2 });
+  assert.ok(largeThread.details.comments_fetched > 0);
+  console.log(`500-comment fetch: ${largeThread.details.comments_fetched} visible comments parsed`);
   const pack = await call('reddit_pack', { topic: 'python', subreddits: 'learnpython', depth: 'quick', max_posts: 2, comments_per_post: 2 });
   assert.ok(pack.details.posts.length > 0);
   assert.ok(pack.details.commented_post_count > 0);
