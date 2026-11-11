@@ -16,7 +16,14 @@ Use the local Reddit tools when the user asks what people on Reddit say, recomme
 - Use `reddit_resolve_subreddits` when the user asks where a topic is discussed or when a focused subreddit scope would improve search.
 - Use `reddit_subreddits` only for raw subreddit search when ranking is not needed.
 - Use `reddit_url_extract` when the user gives an arbitrary Reddit URL, old.reddit URL, post id, or comment id.
-- Use `reddit_trends` for "what is currently hot/top/new in r/LocalLLaMA" style questions.
+- Use `reddit_trends` for hot/top/new/rising/controversial discussions in named communities. Use `subreddits="all"` or `"popular"` for cross-subreddit discovery, not a personal home feed.
+
+## Trend Ordering
+
+- `rising` and `controversial` default to `order="reddit"`, preserving Reddit's listing order; `hot|top|new` keep the existing `order="ranked"` default.
+- Specify `order="reddit"` when native order matters, including `all`/`popular` feeds. With several subreddits, results interleave by native position (round-robin), not by a cross-community popularity rank.
+- `time` applies only to `top` and `controversial`. Rising may return few posts; a rising position is not proof of expertise, consensus, or quality.
+- A JSON 403 `reason` is a per-resource denial; do not assume the cookie expired or retry the denied community repeatedly. Unrelated research can continue. Block-page 403s and 429s still trigger cooldown.
 
 ## Intent Mapping
 
@@ -42,7 +49,7 @@ Use the local Reddit tools when the user asks what people on Reddit say, recomme
 Listing tools return a `next page: pass after=...` line when Reddit supplied a cursor.
 
 - `reddit_search`, `reddit_trends`, `reddit_subreddits`, `reddit_user`, and `reddit_pack` accept a cursor.
-- Reuse it with the same query/scope/sort/time (and the same `username` for `reddit_user`); changing any of those invalidates the cursor.
+- Reuse it with the same query/scope/sort/time (and the same `username` for `reddit_user`); keep `listing` and `order` unchanged for `reddit_trends`. Changing these settings can repeat or skip evidence.
 - One page is usually enough. Fetch a second page only when the first page is thin, the user asks for more, or a claim needs more evidence.
 - Reddit does not error on a bad cursor: it returns HTTP 200 with the same page and the same cursor again. So do not retry the same cursor expecting progress, and do not invent cursor values.
 - `reddit_search` and `reddit_trends` only accept a single cursor for a single-subreddit scope (search also supports all-Reddit scope). With several subreddits the cursor is ignored and the output says so. Follow the per-subreddit instructions in the text or `cursors.per_subreddit`: a safe `after` advances only past a contiguous prefix of returned posts; `restart: true` means re-run that subreddit without `after` to recover unreturned posts. Narrow to one subreddit and deduplicate by post ID, because local ranking may repeat posts.

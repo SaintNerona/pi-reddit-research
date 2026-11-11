@@ -13,7 +13,7 @@ Registers these pi tools:
 - `reddit_thread` — fetch one thread and top comments.
 - `reddit_user` — check a public account: age, karma, account signals, recent posts and comments.
 - `reddit_subreddits` — raw subreddit search.
-- `reddit_trends` — inspect hot/top/new posts in one or more subreddits.
+- `reddit_trends` — inspect hot/top/new/rising/controversial posts in subreddits, including `all` and `popular`.
 
 Also registers `/reddit` command:
 
@@ -51,6 +51,22 @@ Ask pi questions like:
 - "What else has u/foo said about this tool?"
 
 The bundled skill teaches the model when to use `reddit_pack`, `reddit_search`, `reddit_thread`, `reddit_user`, and related tools.
+
+### Trends and cross-subreddit feeds
+
+```
+reddit_trends(subreddits: "LocalLLaMA", listing: "rising")
+reddit_trends(subreddits: "LocalLLaMA", listing: "controversial", time: "week")
+reddit_trends(subreddits: "all", listing: "hot", order: "reddit")
+reddit_trends(subreddits: "popular", listing: "new", order: "reddit")
+```
+
+- Listings: `hot`, `top`, `new`, `rising`, `controversial`. Default: `hot`. Rising may return few posts; it is a discovery signal, not proof of popularity or quality.
+- `time` applies to `top` and `controversial` only (default: `week`).
+- `order: "reddit"` preserves Reddit's per-subreddit listing order. With multiple subreddits, results interleave by position in the supplied subreddit order (round-robin); there is no global ranking across communities.
+- `order: "ranked"` uses the extension's local relevance/engagement ranking. Defaults remain `ranked` for `hot|top|new`; the new `rising|controversial` listings default to `reddit`. Either can be overridden explicitly.
+- `all` and `popular` use the existing subreddit listing path, not your personalized home feed. Reddit may filter their results; do not treat either as exhaustive.
+- Pagination works as before; reuse the same listing, scope, time **and order**.
 
 ### Pagination
 
@@ -152,6 +168,8 @@ Invalid responses are not cached or indexed. Malformed cached payloads are ignor
 `reddit_user` and `reddit_pack` retain partial results and expose failures in `details.errors` and a reserved `fetch errors` line. Do not treat partial evidence as a clean success.
 
 Treat Reddit posts and comments as anecdotal evidence, not verified facts.
+
+HTTP 403 responses with a non-empty JSON `reason` (for example `gold_only` or `private`) are reported as `Reddit denied access: <reason>` without pausing unrelated requests. This classification also applies to unknown reason strings; it assumes a JSON reason denotes a resource-specific denial. HTML, empty, malformed, or reason-less 403 responses retain block/cookie-refresh handling. HTTP 429 responses still start the process-wide rate-limit cooldown. Cooldown duration honors a positive `Retry-After`, otherwise defaults to 300 seconds; cached responses may still be served.
 
 ### How to get your Reddit cookie
 
