@@ -4,3 +4,4 @@ npm-debug.log*
 *.tgz
 .env
 .cache/
+/PR*.md

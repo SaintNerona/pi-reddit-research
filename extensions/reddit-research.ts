@@ -70,6 +70,8 @@ type JsonObject = Record<string, unknown>;
 type RedditSort = "relevance" | "hot" | "top" | "new" | "comments";
 type RedditTime = "hour" | "day" | "week" | "month" | "year" | "all";
 type RedditDepth = "quick" | "normal" | "deep";
+type TrendListing = "hot" | "top" | "new" | "rising" | "controversial";
+type TrendOrder = "reddit" | "ranked";
 type RedditIntent =
 	| "opinions"
 	| "bugs"
@@ -85,6 +87,12 @@ type RedditIntent =
 const sorts = new Set<RedditSort>(["relevance", "hot", "top", "new", "comments"]);
 const times = new Set<RedditTime>(["hour", "day", "week", "month", "year", "all"]);
 const depths = new Set<RedditDepth>(["quick", "normal", "deep"]);
+const trendListings = new Set<TrendListing>(["hot", "top", "new", "rising", "controversial"]);
+const trendOrders = new Set<TrendOrder>(["reddit", "ranked"]);
+
+function defaultTrendOrder(listing: TrendListing): TrendOrder {
+	return listing === "rising" || listing === "controversial" ? "reddit" : "ranked";
+}
 const intents = new Set<RedditIntent>([
 	"opinions",
 	"bugs",
@@ -635,8 +643,25 @@ class RedditRequestQueue {
 		});
 
 		if (response.status === 403 || response.status === 429) {
-			// Forbidden: try refreshing the cookie from config in case it was updated
 			if (response.status === 403) {
+				const body = await response.text();
+				let reason: string | undefined;
+				try {
+					const data: unknown = JSON.parse(body);
+					if (data && typeof data === "object" && !Array.isArray(data)) {
+						reason = optionalString((data as JsonObject).reason);
+					}
+				} catch {
+					// HTML/empty/malformed bodies still use the block/cookie handling below.
+				}
+				// A JSON reason denotes a resource-specific denial (including unknown reasons),
+				// not a request to pause all unrelated Reddit research.
+				if (reason) {
+					const error = `Reddit denied access: ${compactWhitespace(reason, 120)}`;
+					store.saveRequest(url, response.status, ttlMs, undefined, error);
+					throw new Error(error);
+				}
+				// Try refreshing the cookie from config in case it was updated.
 				const previousCookie = redditCookie;
 				redditCookie = loadRedditCookie();
 				if (redditCookie && redditCookie !== previousCookie) {
@@ -1852,21 +1877,23 @@ export default function redditResearch(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "reddit_trends",
 		label: "Reddit Trends",
-		description: "Get hot, top, or new posts from one or more subreddits.",
-		promptSnippet: "Inspect hot/top/new posts in subreddits for recent Reddit trends",
+		description: "Get hot, top, new, rising, or controversial posts from one or more subreddits (including all or popular). Rising may return few posts. Use order=reddit to preserve Reddit's listing order.",
+		promptSnippet: "Inspect hot/top/new/rising/controversial posts in subreddits or r/all and r/popular",
 		parameters: Type.Object({
-			subreddits: Type.String({ description: "Subreddit or comma-separated subreddit names, for example: artificial, technology, ArtificialInteligence. Do not pass a JSON list." }),
-			listing: Type.Optional(Type.String({ enum: ["hot", "top", "new"], description: "Listing type. Default hot." })),
-			time: Type.Optional(Type.String({ enum: [...times], description: "Top time window. Used only for listing=top. Default week." })),
+			subreddits: Type.String({ description: "Subreddit or comma-separated names, for example: artificial, technology. Use all or popular for cross-subreddit feeds. Do not pass a JSON list." }),
+			listing: Type.Optional(Type.String({ enum: [...trendListings], description: "Listing type: hot, top, new, rising, controversial. Default hot." })),
+			order: Type.Optional(Type.String({ enum: [...trendOrders], description: "reddit preserves native order (round-robin across subreddits); ranked uses local relevance/engagement ranking. Default reddit for rising/controversial, ranked for hot/top/new." })),
+			time: Type.Optional(Type.String({ enum: [...times], description: "Time window for top and controversial only. Default week." })),
 			limit: Type.Optional(Type.Number({ description: "Maximum total posts. Default 10, max 30." })),
 			after: Type.Optional(Type.String({ description: "Pagination cursor from a previous reddit_trends result. Needs a single-subreddit scope." })),
 		}),
 		prepareArguments(args) {
 			const raw = (args && typeof args === "object" ? args : {}) as JsonObject;
-			const listing = optionalString(raw.listing)?.toLowerCase();
+			const listing = enumValue(raw.listing, trendListings, "hot");
 			return {
 				subreddits: stringListParam(raw.subreddits) ?? "",
-				listing: ["hot", "top", "new"].includes(listing ?? "") ? listing! : "hot",
+				listing,
+				order: enumValue(raw.order, trendOrders, defaultTrendOrder(listing)),
 				time: enumValue(raw.time, times, "week"),
 				limit: clampInt(raw.limit, 10, 1, 30),
 				after: optionalString(raw.after),
@@ -1876,7 +1903,8 @@ export default function redditResearch(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, signal) {
 			const subreddits = stringList(params.subreddits) ?? [];
 			if (!subreddits.length) return textResult("Provide at least one subreddit.");
-			const listing = optionalString(params.listing)?.toLowerCase() ?? "hot";
+			const listing = enumValue(params.listing, trendListings, "hot");
+			const order = enumValue(params.order, trendOrders, defaultTrendOrder(listing));
 			const limit = clampInt(params.limit, 10, 1, 30);
 			const after = optionalString(params.after);
 			const multiScope = subreddits.length > 1;
@@ -1885,7 +1913,7 @@ export default function redditResearch(pi: ExtensionAPI) {
 			const effectiveAfter = multiScope ? undefined : after;
 			const perSub = Math.max(1, Math.ceil(limit / subreddits.length));
 			const entries = subreddits.map((subreddit) => {
-				const t = listing === "top" ? `&t=${encodeURIComponent(enumValue(params.time, times, "week"))}` : "";
+				const t = listing === "top" || listing === "controversial" ? `&t=${encodeURIComponent(enumValue(params.time, times, "week"))}` : "";
 				const cursor = effectiveAfter ? `&after=${encodeURIComponent(effectiveAfter)}` : "";
 				return {
 					key: subreddit,
@@ -1893,16 +1921,26 @@ export default function redditResearch(pi: ExtensionAPI) {
 				};
 			});
 			const { listings } = await fetchPagedListings(entries, defaultTtlMs, signal);
-			const parsed: RedditPost[] = [];
-			for (const { data } of listings) parsed.push(...parsePosts(data));
-			const posts = parsed
-				.map((post) => rankPost(post, subreddits.join(" ")))
-				.sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0))
-				.slice(0, limit);
+			const pages = listings.map(({ data }) => parsePosts(data));
+			let ordered: RedditPost[];
+			if (order === "ranked") {
+				ordered = pages.flat()
+					.map((post) => rankPost(post, subreddits.join(" ")))
+					.sort((a, b) => (b.rankScore ?? 0) - (a.rankScore ?? 0));
+			} else {
+				// Native positions are meaningful within each subreddit, not across them.
+				// Interleave rather than inventing a cross-subreddit ranking.
+				ordered = [];
+				const longest = pages.reduce((max, page) => Math.max(max, page.length), 0);
+				for (let i = 0; i < longest; i++) {
+					for (const page of pages) if (page[i]) ordered.push(page[i]);
+				}
+			}
+			const posts = ordered.slice(0, limit);
 			store.savePosts(posts);
 			const cursors = returnedListingCursors(listings, posts, Boolean(multiScope && after));
 			return textResult(formatPosts(posts, `Reddit ${listing} trends in ${subreddits.map((s) => `r/${s}`).join(", ")}`),
-				{ posts, cursors }, listingNavigation(cursors, "listing/time"));
+				{ posts, cursors, order }, listingNavigation(cursors, "listing/time/order"));
 		},
 	});
 }

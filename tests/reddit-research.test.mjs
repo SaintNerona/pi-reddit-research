@@ -242,3 +242,134 @@ test('reddit_user respects cancellation instead of fetching remaining sections',
   await assert.rejects(() => tool.execute('cancel-test', tool.prepareArguments({ username: 'canceluser', sections: 'about,posts,comments' }), controller.signal), /cancelled-test/);
   assert.equal(requests.length - before, 1);
 });
+
+for (const mode of ['rising', 'controversial']) {
+  test(`${mode} defaults to Reddit order and only controversial sends the time window`, async () => {
+    respond = () => ok(listing([post('native1', mode, 0), post('native2', mode, 100000)], 't3_native2'));
+    const before = requests.length;
+    const result = await call('reddit_trends', { subreddits: `Native${mode}`, listing: mode, time: 'month', limit: 2 });
+    assert.deepEqual(result.details.posts.map((p) => p.id), ['native1', 'native2']);
+    assert.equal(result.details.order, 'reddit');
+    assert.equal(result.details.cursors.after, 't3_native2');
+    const [url] = requests.slice(before);
+    assert.equal(url.pathname, `/r/Native${mode}/${mode}.json`);
+    assert.equal(url.searchParams.get('t'), mode === 'controversial' ? 'month' : null);
+    const ranked = await call('reddit_trends', { subreddits: `Native${mode}`, listing: mode, time: 'month', limit: 2, order: 'ranked' });
+    assert.deepEqual(ranked.details.posts.map((p) => p.id), ['native2', 'native1']);
+    assert.equal(requests.length - before, 1, 'order changes reuse the same cached listing');
+  });
+}
+
+for (const mode of ['hot', 'top', 'new']) {
+  test(`${mode} keeps ranked defaults and supports explicit Reddit order`, async () => {
+    respond = () => ok(listing([post('legacy1', 'Legacy', 0), post('legacy2', 'Legacy', 100000)]));
+    const before = requests.length;
+    const args = { subreddits: `Legacy${mode}`, listing: mode, time: 'day', limit: 2 };
+    const ranked = await call('reddit_trends', args);
+    assert.deepEqual(ranked.details.posts.map((p) => p.id), ['legacy2', 'legacy1']);
+    assert.equal(ranked.details.order, 'ranked');
+    assert.equal(requests[before].searchParams.get('t'), mode === 'top' ? 'day' : null);
+    const native = await call('reddit_trends', { ...args, order: 'reddit' });
+    assert.deepEqual(native.details.posts.map((p) => p.id), ['legacy1', 'legacy2']);
+  });
+}
+
+test('native multi-subreddit ordering interleaves positions and preserves safe cursor boundaries', async () => {
+  respond = (url) => {
+    const sub = url.pathname.split('/')[2];
+    const isAlpha = sub === 'NativeA';
+    return ok(listing([post(isAlpha ? 'intera1' : 'interb1', sub, 0), post(isAlpha ? 'intera2' : 'interb2', sub, 100000)], isAlpha ? 't3_intera2' : 't3_interb2'));
+  };
+  const before = requests.length;
+  const result = await call('reddit_trends', { subreddits: 'NativeA,NativeB', listing: 'rising', limit: 3, after: 't3_ignored' });
+  assert.deepEqual(result.details.posts.map((p) => p.id), ['intera1', 'interb1', 'intera2']);
+  assert.equal(result.details.cursors.after_ignored, true);
+  assert.equal(result.details.cursors.per_subreddit.NativeA.after, 't3_intera2');
+  assert.equal(result.details.cursors.per_subreddit.NativeB.after, 't3_interb1');
+  assert.ok(requests.slice(before).every((url) => !url.searchParams.has('after')));
+  assert.match(text(result), /after was ignored/);
+  assert.match(text(result), /listing\/time\/order/);
+});
+
+test('native ordering handles uneven and empty subreddit listings', async () => {
+  respond = (url) => ok(listing(url.pathname.includes('/EmptyNative/') ? []
+    : [post('uneven1'), post('uneven2'), post('uneven3')]));
+  const result = await call('reddit_trends', { subreddits: 'EmptyNative,UnevenNative', listing: 'new', order: 'reddit', limit: 5 });
+  assert.deepEqual(result.details.posts.map((p) => p.id), ['uneven1', 'uneven2', 'uneven3']);
+});
+
+for (const sub of ['all', 'popular']) {
+  test(`r/${sub} uses the existing trends listing path and cursor`, async () => {
+    respond = (url) => ok(url.searchParams.has('after')
+      ? listing([post('feed002', 'ActualCommunity')])
+      : listing([post('feed001', 'ActualCommunity')], 't3_feed001'));
+    const before = requests.length;
+    const args = { subreddits: sub, listing: 'hot', order: 'reddit', limit: 1 };
+    const first = await call('reddit_trends', args);
+    const second = await call('reddit_trends', { ...args, after: first.details.cursors.after });
+    assert.deepEqual(first.details.posts.map((p) => p.id), ['feed001']);
+    assert.deepEqual(second.details.posts.map((p) => p.id), ['feed002']);
+    assert.ok(requests.slice(before).every((url) => url.pathname === `/r/${sub}/hot.json`));
+    assert.equal(requests[before + 1].searchParams.get('after'), 't3_feed001');
+  });
+}
+
+test('trends preparation normalizes listing/order and defaults invalid values safely', () => {
+  const tool = extension.tools.get('reddit_trends').definition;
+  assert.equal(tool.prepareArguments({ listing: ' RISING ', order: ' REDDIT ' }).order, 'reddit');
+  assert.equal(tool.prepareArguments({ listing: 'controversial', order: 'invalid' }).order, 'reddit');
+  assert.equal(tool.prepareArguments({ listing: 'hot', order: 'invalid' }).order, 'ranked');
+  assert.equal(tool.prepareArguments({ listing: 'best' }).listing, 'hot');
+});
+
+test('403 resource denials do not block unrelated uncached requests; block/rate-limit behavior is preserved', async (t) => {
+  // All requests below are synthetic. A controlled clock expires each case's cooldown
+  // without waiting five real minutes or letting one case contaminate the next.
+  let now = Date.now() + 600000;
+  t.mock.method(Date, 'now', () => now);
+  let caseId = 0;
+  const runCase = async (name, status, body, headers = {}, denial = false, refresh = false) => {
+    now += 600000;
+    const key = `status-case-${caseId++}`;
+    const previousCookie = process.env.PI_REDDIT_COOKIE;
+    const before = requests.length;
+    respond = (url) => {
+      now += 251;
+      if (url.searchParams.get('q') === key) {
+        if (refresh) process.env.PI_REDDIT_COOKIE = 'synthetic-refreshed-cookie';
+        return new Response(body, { status, headers });
+      }
+      return ok(listing([post('after01')]));
+    };
+    try {
+      const rejected = await invoke(extension, 'reddit_search', { query: key });
+      assert.equal(rejected.isError, true, name);
+      assert.match(text(rejected), denial ? /Reddit denied access:/ : refresh ? /cookie refreshed/ : /cooldown started/, name);
+      if (denial) assert.doesNotMatch(text(rejected), /cookie may be expired|cooldown started/, name);
+      const next = await invoke(extension, 'reddit_search', { query: `${key}-uncached` });
+      assert.equal(next.isError, !denial && !refresh, name);
+      assert.equal(requests.length - before, denial || refresh ? 2 : 1, `${name}: actual fetch count, not a cached success`);
+      if (!denial && !refresh) {
+        assert.match(text(next), /cooling down/, name);
+        const seconds = Number(headers['retry-after']) > 0 ? Number(headers['retry-after']) : 300;
+        now += seconds * 1000 + 1;
+        const recovered = await call('reddit_search', { query: `${key}-uncached` });
+        assert.equal(recovered.details.posts.length, 1);
+        assert.equal(requests.length - before, 2, `${name}: network resumes after cooldown`);
+      }
+    } finally {
+      process.env.PI_REDDIT_COOKIE = previousCookie;
+    }
+  };
+  for (const reason of ['gold_only', 'private', 'banned', 'quarantined', 'unknown_resource_reason']) {
+    await runCase(reason, 403, JSON.stringify({ reason }), {}, true);
+  }
+  await runCase('JSON reason with changed cookie', 403, '{"reason":"private"}', {}, true, true);
+  for (const [name, body] of Object.entries({ html: '<html>blocked</html>', empty: '', malformed: '{bad', no_reason: '{}', numeric: '{"reason":42}', blank: '{"reason":"  "}', null: 'null' })) {
+    await runCase(name, 403, body);
+  }
+  await runCase('403 Retry-After', 403, '<html>blocked</html>', { 'retry-after': '17' });
+  await runCase('invalid Retry-After', 403, '', { 'retry-after': 'invalid' });
+  await runCase('429 reason still rate limited', 429, '{"reason":"private"}', { 'retry-after': '30' });
+  await runCase('cookie refreshed', 403, '<html>blocked</html>', {}, false, true);
+});

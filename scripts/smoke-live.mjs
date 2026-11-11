@@ -32,6 +32,16 @@ try {
   await call('reddit_url_extract', { url_or_id: 'https://www.reddit.com/user/spez/comments/' });
   await pages('reddit_search', { query: 'python', subreddits: 'learnpython', sort: 'new', limit: 2 });
   await pages('reddit_trends', { subreddits: 'learnpython', listing: 'new', limit: 2 });
+  for (const mode of ['rising', 'controversial']) {
+    const result = await call('reddit_trends', { subreddits: 'learnpython', listing: mode, time: 'week', limit: 2 });
+    assert.equal(result.details.order, 'reddit');
+    // An empty rising/controversial listing is valid; offline fixtures assert ordering.
+  }
+  for (const sub of ['all', 'popular']) {
+    const result = await call('reddit_trends', { subreddits: sub, listing: 'hot', order: 'reddit', limit: 2 });
+    assert.equal(result.details.order, 'reddit');
+    assert.ok(result.details.posts.length > 0, `r/${sub}: no posts returned`);
+  }
   await pages('reddit_user', { username: 'spez', sections: 'about,posts', limit: 2 }, 'after_posts');
   await pages('reddit_user', { username: 'spez', sections: 'comments', limit: 2 }, 'after_comments');
   const candidates = await call('reddit_search', { query: 'python', subreddits: 'learnpython', limit: 2 });
